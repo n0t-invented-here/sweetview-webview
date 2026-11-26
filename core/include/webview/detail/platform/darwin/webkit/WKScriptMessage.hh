@@ -42,6 +42,16 @@ inline id WKScriptMessage_get_body(id self) {
   return objc::msg_send<id>(self, objc::selector("body"));
 }
 
+// True only when the message came from the top-level document. Every frame,
+// cross-origin iframes included, can reach window.webkit.messageHandlers, so
+// a message without main-frame info is treated as coming from a subframe.
+inline bool WKScriptMessage_is_from_main_frame(id self) {
+  auto frame_info = objc::msg_send<id>(self, objc::selector("frameInfo"));
+  return frame_info &&
+         static_cast<bool>(
+             objc::msg_send<BOOL>(frame_info, objc::selector("isMainFrame")));
+}
+
 } // namespace webkit
 } // namespace detail
 } // namespace webview

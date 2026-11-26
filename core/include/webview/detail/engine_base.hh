@@ -372,8 +372,16 @@ protected:
   }
 
   std::string create_init_script(const std::string &post_fn) {
+    // Top-level document only. WebView2 runs scripts added with
+    // AddScriptToExecuteOnDocumentCreated in every frame, so without this
+    // guard a cross-origin iframe would get window.__webview__ and every
+    // bound function. (WebKit already injects these into the main frame
+    // only.)
     auto js = std::string{} + "(function() {\n\
   'use strict';\n\
+  if (window !== window.top) {\n\
+    return;\n\
+  }\n\
   function generateId() {\n\
     var crypto = window.crypto || window.msCrypto;\n\
     var bytes = new Uint8Array(16);\n\
@@ -454,8 +462,12 @@ protected:
     }
     js_names += "]";
 
+    // Top-level document only, like the init script.
     auto js = std::string{} + "(function() {\n\
   'use strict';\n\
+  if (window !== window.top || !window.__webview__) {\n\
+    return;\n\
+  }\n\
   var methods = " +
               js_names + ";\n\
   methods.forEach(function(name) {\n\

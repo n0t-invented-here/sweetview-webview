@@ -628,6 +628,12 @@ private:
       class_addMethod(
           cls, objc::selector("userContentController:didReceiveScriptMessage:"),
           (IMP)(+[](id self, SEL, id, id msg) {
+            // Bindings belong to the top-level document only: drop messages
+            // posted from any iframe so a cross-origin frame cannot call
+            // host bindings through window.webkit.messageHandlers.
+            if (!WKScriptMessage_is_from_main_frame(msg)) {
+              return;
+            }
             auto w = get_associated_webview(self);
             w->on_message(
                 NSString_get_UTF8String(WKScriptMessage_get_body(msg)));

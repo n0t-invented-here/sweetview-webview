@@ -277,6 +277,11 @@ public:
   HRESULT STDMETHODCALLTYPE
   Invoke(ICoreWebView2 * /*sender*/,
          ICoreWebView2WebMessageReceivedEventArgs *args) {
+    // ICoreWebView2::WebMessageReceived fires only for the top-level
+    // document; an iframe's chrome.webview.postMessage goes to
+    // ICoreWebView2Frame2::WebMessageReceived, which is never subscribed.
+    // So iframes cannot reach bindings through this path (the live iframe
+    // test in sweetview-webview-bun checks it).
     LPWSTR message{};
     auto res = args->TryGetWebMessageAsString(&message);
     if (SUCCEEDED(res) && m_msgCb) {
