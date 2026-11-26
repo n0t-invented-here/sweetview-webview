@@ -171,13 +171,15 @@ class webview2_com_handler
       public ICoreWebView2CreateCoreWebView2ControllerCompletedHandler,
       public ICoreWebView2WebMessageReceivedEventHandler,
       public ICoreWebView2PermissionRequestedEventHandler,
-      public ICoreWebView2WebResourceRequestedEventHandler {
+      public ICoreWebView2WebResourceRequestedEventHandler,
+      public ICoreWebView2ContentLoadingEventHandler {
   using webview2_com_handler_cb_t =
       std::function<void(ICoreWebView2Controller *, ICoreWebView2 *webview)>;
   using resource_requested_cb_t =
       std::function<void(ICoreWebView2WebResourceRequestedEventArgs *)>;
   using file_drop_message_cb_t =
       std::function<void(ICoreWebView2WebMessageReceivedEventArgs *)>;
+  using content_loading_cb_t = std::function<void()>;
 
 public:
   webview2_com_handler(HWND hwnd, msg_cb_t msgCb, webview2_com_handler_cb_t cb)
@@ -222,7 +224,8 @@ public:
         cast_if_equal_iid(this, riid, environment_completed, ppv) ||
         cast_if_equal_iid(this, riid, message_received, ppv) ||
         cast_if_equal_iid(this, riid, permission_requested, ppv) ||
-        cast_if_equal_iid(this, riid, web_resource_requested, ppv)) {
+        cast_if_equal_iid(this, riid, web_resource_requested, ppv) ||
+        cast_if_equal_iid(this, riid, content_loading, ppv)) {
       return S_OK;
     }
 
@@ -271,6 +274,7 @@ public:
     ::EventRegistrationToken token;
     webview->add_WebMessageReceived(this, &token);
     webview->add_PermissionRequested(this, &token);
+    webview->add_ContentLoading(this, &token);
 
     if (m_cb) {
       // The callback takes references of its own; ours goes with webview.
@@ -341,6 +345,21 @@ public:
     return S_OK;
   }
 
+  // A new top-level document is starting to load (not raised for same-page
+  // navigations).
+  HRESULT STDMETHODCALLTYPE
+  Invoke(ICoreWebView2 * /*sender*/,
+         ICoreWebView2ContentLoadingEventArgs * /*args*/) {
+    if (m_content_loading_cb) {
+      try {
+        m_content_loading_cb();
+      } catch (...) {
+        // Nothing may unwind into WebView2.
+      }
+    }
+    return S_OK;
+  }
+
   // Called for every request the WebResourceRequested filter lets through.
   void set_resource_requested_handler(resource_requested_cb_t cb) noexcept {
     m_resource_requested_cb = std::move(cb);
@@ -349,6 +368,11 @@ public:
   // Called for the web message the file drop script posts.
   void set_file_drop_message_handler(file_drop_message_cb_t cb) noexcept {
     m_file_drop_cb = std::move(cb);
+  }
+
+  // Called when a new top-level document starts loading.
+  void set_content_loading_handler(content_loading_cb_t cb) noexcept {
+    m_content_loading_cb = std::move(cb);
   }
 
   // The environment the controller was created from; null until then.
@@ -370,6 +394,7 @@ public:
     m_attempt_handler = nullptr;
     m_msgCb = nullptr;
     m_file_drop_cb = nullptr;
+    m_content_loading_cb = nullptr;
   }
 
   // Retry creating a WebView2 environment.
@@ -422,6 +447,7 @@ private:
   webview2_com_handler_cb_t m_cb;
   resource_requested_cb_t m_resource_requested_cb;
   file_drop_message_cb_t m_file_drop_cb;
+  content_loading_cb_t m_content_loading_cb;
   ICoreWebView2Environment *m_environment = nullptr;
   std::atomic<ULONG> m_ref_count{1};
   std::function<HRESULT()> m_attempt_handler;
@@ -1131,6 +1157,24 @@ protected:
   noresult begin_response_impl(uint64_t request_id, int status,
                                http_headers_t headers) override {
     com_ptr<streaming_istream> stream{new streaming_istream{}};
+    // When WebView2 lets go of the response early (the page cancelled it),
+    // the stream drops its buffer itself and this queues forgetting it.
+    // Runs inside the stream's Release() under the stream's lock, so it only
+    // queues: the UI thread takes m_streams_mutex later. deinit() marks the
+    // engine destroyed before it aborts the streams (which waits out a
+    // running callback and drops it), so this never reaches a dead engine.
+    {
+      auto alive = alive_token();
+      auto key = reinterpret_cast<std::uintptr_t>(stream.get());
+      stream->set_on_abandoned([this, alive, request_id, key] {
+        if (!alive->load()) {
+          return;
+        }
+        dispatch_if_alive([this, request_id, key] {
+          forget_abandoned_stream(request_id, key);
+        });
+      });
+    }
     {
       std::lock_guard<std::mutex> lock{m_streams_mutex};
       // NOLINTNEXTLINE(readability-container-contains): contains() requires C++20
@@ -1179,18 +1223,29 @@ protected:
   }
 
   noresult end_response_impl(uint64_t request_id) override {
-    com_ptr<streaming_istream> stream;
-    {
-      std::lock_guard<std::mutex> lock{m_streams_mutex};
-      auto found = m_active_streams.find(request_id);
-      if (found == m_active_streams.end()) {
-        return {}; // already ended, or never begun
-      }
-      stream = std::move(found->second);
+    std::lock_guard<std::mutex> lock{m_streams_mutex};
+    auto found = m_active_streams.find(request_id);
+    if (found == m_active_streams.end()) {
+      return {}; // already ended, or never begun
+    }
+    // Finished while still registered, so there is never a moment when the
+    // stream is open but out of reach of abort_active_streams().
+    found->second->finish();
+    m_active_streams.erase(found);
+    return {};
+  }
+
+  // UI thread, queued by a stream's on_abandoned callback: forgets the
+  // stream if it is still the one registered for request_id. It has
+  // already aborted itself and dropped its buffer.
+  void forget_abandoned_stream(uint64_t request_id,
+                               std::uintptr_t key) noexcept {
+    std::lock_guard<std::mutex> lock{m_streams_mutex};
+    auto found = m_active_streams.find(request_id);
+    if (found != m_active_streams.end() &&
+        reinterpret_cast<std::uintptr_t>(found->second.get()) == key) {
       m_active_streams.erase(found);
     }
-    stream->finish();
-    return {};
   }
 
   // UI thread. Sets the streamed response on the deferred request and
@@ -1251,16 +1306,14 @@ protected:
   // Aborts stream and forgets it, if it is still the one registered.
   void drop_stream(uint64_t request_id,
                    const com_ptr<streaming_istream> &stream) noexcept {
-    {
-      std::lock_guard<std::mutex> lock{m_streams_mutex};
-      auto found = m_active_streams.find(request_id);
-      if (found != m_active_streams.end() &&
-          found->second.get() == stream.get()) {
-        m_active_streams.erase(found);
-      }
-    }
+    std::lock_guard<std::mutex> lock{m_streams_mutex};
     if (stream) {
       stream->abort();
+    }
+    auto found = m_active_streams.find(request_id);
+    if (found != m_active_streams.end() &&
+        found->second.get() == stream.get()) {
+      m_active_streams.erase(found);
     }
   }
 
@@ -1279,38 +1332,54 @@ protected:
   }
 
   // File drops (see webview_set_file_drop_handler). The drop script is
-  // always installed; this flips whether it takes file drops, for the
-  // current document and every one after it.
+  // installed once by embed() and starts disabled in every document; this
+  // flips the flag in the current document, and on_content_loading() sets it
+  // again in each new one. Never blocks and never pumps messages (unlike
+  // AddScriptToExecuteOnDocumentCreated), so it is safe to call from inside
+  // a file drop handler or any other callback on the UI thread.
   noresult set_file_drop_handler_impl(bool enabled) override {
     if (enabled == m_file_drop_enabled) {
       return {};
     }
     m_file_drop_enabled = enabled;
     if (!m_webview) {
-      return {}; // embed() installs the script with the current value
+      return {}; // on_content_loading() applies it to the first document
     }
-    if (m_file_drop_script) {
-      m_file_drop_script =
-          replace_user_script(*m_file_drop_script, create_file_drop_script());
-    }
-    return eval(std::string{"if (window === window.top) {"
-                            " window.__webview_file_drop_enabled__ = "} +
-                (enabled ? "true" : "false") + "; }");
+    return eval(file_drop_flag_script());
   }
 
-  // Top-level document only, like the init script. While enabled, a drag
+  std::string file_drop_flag_script() const {
+    return std::string{"if (window === window.top) {"
+                       " window.__webview_file_drop_enabled__ = "} +
+           (m_file_drop_enabled ? "true" : "false") + "; }";
+  }
+
+  // UI thread: a new top-level document is loading. Its drop script starts
+  // disabled, so enable it there when a handler is set. ExecuteScript is
+  // asynchronous; the drop script never overwrites a flag already set, so
+  // the two may run in either order.
+  void on_content_loading() {
+    if (m_file_drop_enabled && m_webview) {
+      eval(file_drop_flag_script());
+    }
+  }
+
+  // Top-level document only, like the init script. Installed once and the
+  // same in every document; the flag starts false unless the host already
+  // set it (see on_content_loading). While enabled, a drag
   // that carries files is accepted (dragover) and its drop is kept from the
   // browser's default (opening the file) and posted to the host with the
   // File objects, whose paths WebView2 reveals only to the host. Page
   // listeners still see both events.
-  std::string create_file_drop_script() const {
-    return std::string{} + "(function() {\n\
+  static std::string create_file_drop_script() {
+    return "(function() {\n\
   'use strict';\n\
   if (window !== window.top) {\n\
     return;\n\
   }\n\
-  window.__webview_file_drop_enabled__ = " +
-           (m_file_drop_enabled ? "true" : "false") + ";\n\
+  if (typeof window.__webview_file_drop_enabled__ !== 'boolean') {\n\
+    window.__webview_file_drop_enabled__ = false;\n\
+  }\n\
   function carriesFiles(e) {\n\
     return !!(window.__webview_file_drop_enabled__ && e.dataTransfer &&\n\
       e.dataTransfer.types &&\n\
@@ -1337,7 +1406,10 @@ protected:
   }
 
   // UI thread: the drop script's message. Reads each attached File's path
-  // (ICoreWebView2File) and hands the paths to the file drop handler.
+  // (ICoreWebView2File) here, while the event args are valid, then queues
+  // the handler call so WebMessageReceived returns first: the handler then
+  // runs from the message loop, not inside a WebView2 event, and may set or
+  // clear the drop handler, open dialogs, or destroy the webview.
   void on_file_drop_message(ICoreWebView2WebMessageReceivedEventArgs *args) {
     if (!file_drop_handler() || !args) {
       return;
@@ -1376,7 +1448,12 @@ protected:
       }
       paths.push_back(wpath.narrow());
     }
-    deliver_file_drop(paths);
+    if (paths.empty()) {
+      return;
+    }
+    // deliver_file_drop() reads the handler again when it runs, so a
+    // handler cleared in between is never called.
+    dispatch_if_alive([this, paths] { deliver_file_drop(paths); });
   }
 
   // Releases every request still open without answering it. Runs after the
@@ -1733,6 +1810,8 @@ private:
         [this](ICoreWebView2WebMessageReceivedEventArgs *args) {
           on_file_drop_message(args);
         });
+    m_com_handler->set_content_loading_handler(
+        [this] { on_content_loading(); });
 
     m_com_handler->set_attempt_handler([&] {
       return m_webview2_loader.create_environment_with_options(
@@ -1775,7 +1854,7 @@ private:
     add_init_script("function(message) {\n\
   return window.chrome.webview.postMessage(message);\n\
 }");
-    m_file_drop_script = add_user_script(create_file_drop_script());
+    add_user_script(create_file_drop_script());
     auto served = serve_assets();
     if (!served.ok()) {
       return served;
@@ -1888,9 +1967,8 @@ private:
   // m_streams_mutex: chunks arrive from any thread.
   std::mutex m_streams_mutex;
   std::map<uint64_t, com_ptr<streaming_istream>> m_active_streams;
-  // The drop script (see create_file_drop_script) and whether it takes
-  // file drops.
-  user_script *m_file_drop_script{};
+  // Whether the drop script (see create_file_drop_script) takes file drops;
+  // UI thread only.
   bool m_file_drop_enabled{};
   // Work queued by dispatch_impl, run in order by the message window.
   std::mutex m_dispatch_mutex;

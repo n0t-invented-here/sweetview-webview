@@ -337,8 +337,11 @@ window.__webview__.onUnbind(" +
   // Files dropped from the operating system go to fn (see
   // webview_set_file_drop_handler); NULL hands drops back to the page.
   noresult set_file_drop_handler(webview_file_drop_handler_t fn, void *arg) {
-    m_file_drop_handler = fn;
-    m_file_drop_handler_arg = fn ? arg : nullptr;
+    {
+      std::lock_guard<std::mutex> lock{m_file_drop_mutex};
+      m_file_drop_handler = fn;
+      m_file_drop_handler_arg = fn ? arg : nullptr;
+    }
     return set_file_drop_handler_impl(fn != nullptr);
   }
 
@@ -414,14 +417,22 @@ protected:
   virtual noresult set_file_drop_handler_impl(bool /*enabled*/) { return {}; }
 
   webview_file_drop_handler_t file_drop_handler() const {
+    std::lock_guard<std::mutex> lock{m_file_drop_mutex};
     return m_file_drop_handler;
   }
 
   // Hands dropped paths to the file drop handler as a JSON array of strings.
   // Runs on the UI thread. Nothing is called when no handler is set or no
-  // path is given.
+  // path is given. The handler and its argument are read together under the
+  // lock and called outside it, so the handler may replace or clear itself.
   void deliver_file_drop(const std::vector<std::string> &paths) {
-    auto fn = m_file_drop_handler;
+    webview_file_drop_handler_t fn;
+    void *arg;
+    {
+      std::lock_guard<std::mutex> lock{m_file_drop_mutex};
+      fn = m_file_drop_handler;
+      arg = m_file_drop_handler_arg;
+    }
     if (!fn || paths.empty()) {
       return;
     }
@@ -435,7 +446,7 @@ protected:
       json += json_escape(path);
     }
     json += ']';
-    fn(json.c_str(), m_file_drop_handler_arg);
+    fn(json.c_str(), arg);
   }
 
   // Queues f on the UI thread; f does nothing if the engine is destroyed
@@ -685,6 +696,7 @@ private:
   std::map<std::string, asset_t> m_assets;
   webview_request_handler_t m_request_handler{};
   void *m_request_handler_arg{};
+  mutable std::mutex m_file_drop_mutex;
   webview_file_drop_handler_t m_file_drop_handler{};
   void *m_file_drop_handler_arg{};
   // False once the engine is being destroyed; see mark_destroying.

@@ -396,10 +396,16 @@ WEBVIEW_API webview_error_t webview_set_allow_external_drop(webview_t w,
  * thread.
  *
  * Remarks:
- * - Windows: the top-level document's drop event hands the dropped File
- *   objects to the host with chrome.webview.postMessageWithAdditionalObjects,
- *   which gives their paths (ICoreWebView2File). Needs external drop allowed
- *   (see webview_set_allow_external_drop) and WebView2 Runtime 113 or later.
+ * - Windows: drops are captured only on the trusted top-level document,
+ *   never inside an iframe (cross-origin or not). The top-level document's
+ *   drop event hands the dropped File objects to the host with
+ *   chrome.webview.postMessageWithAdditionalObjects, and WebView2's
+ *   ICoreWebView2File attachment gives their paths; a drop on an iframe is
+ *   left to the iframe and never reaches @p fn. @p fn is called from the
+ *   message loop after WebView2's event has returned, so it may set or clear
+ *   the handler, open dialogs, or destroy the webview. Needs external drop
+ *   allowed (see webview_set_allow_external_drop) and WebView2 Runtime 113 or
+ *   later.
  * - macOS: the WKWebView takes the drag when its pasteboard holds file URLs.
  * - Linux: accepted; does nothing.
  *

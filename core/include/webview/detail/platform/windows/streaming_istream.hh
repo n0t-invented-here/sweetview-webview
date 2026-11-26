@@ -35,6 +35,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstring>
+#include <functional>
 #include <mutex>
 #include <string>
 
@@ -58,7 +59,10 @@ namespace detail {
 // read-only, forward-only IStream fed from any thread with push() and closed
 // with finish() or abort(). WebView2 reads it on a background thread, where
 // Read() blocks until bytes arrive, the stream ends, or it is aborted. Only
-// bytes not yet read are held.
+// bytes not yet read are held. When WebView2 lets go of a stream it was
+// handed before the stream ended (the page cancelled the response), the
+// stream aborts itself at once, dropping what is buffered, and calls the
+// on_abandoned callback so its owner can forget it.
 //
 // Free-threaded: every member is safe from any thread, and the object
 // aggregates the free-threaded marshaler (and reports IAgileObject) so COM
@@ -78,6 +82,19 @@ public:
   streaming_istream &operator=(const streaming_istream &) = delete;
   streaming_istream(streaming_istream &&) = delete;
   streaming_istream &operator=(streaming_istream &&) = delete;
+
+  // Called at most once, from whichever thread makes the Release() that
+  // leaves only the owner's reference on a handed-off stream that has not
+  // ended. It runs with the stream's lock held, so it must not call back
+  // into the stream; it should only queue the owner's cleanup. finish() and
+  // abort() drop it, so once either returns it can never run.
+  void set_on_abandoned(std::function<void()> fn) {
+    std::lock_guard<std::mutex> lock{m_mutex};
+    if (m_eof || m_aborted) {
+      return;
+    }
+    m_on_abandoned = std::move(fn);
+  }
 
   // Appends bytes for the reader. False, and nothing kept, once the stream
   // has ended or been aborted.
@@ -103,6 +120,7 @@ public:
     {
       std::lock_guard<std::mutex> lock{m_mutex};
       m_eof = true;
+      m_on_abandoned = nullptr;
     }
     m_cv.notify_all();
   }
@@ -114,7 +132,9 @@ public:
       std::lock_guard<std::mutex> lock{m_mutex};
       m_aborted = true;
       m_buffer.clear();
+      m_buffer.shrink_to_fit();
       m_read_pos = 0;
+      m_on_abandoned = nullptr;
     }
     m_cv.notify_all();
   }
@@ -170,17 +190,26 @@ public:
     auto count = --m_ref_count;
     if (count == 0) {
       delete this;
+    } else if (count == 1 && m_handed_off.load()) {
+      on_last_foreign_release();
     }
     return count;
   }
 
   // ISequentialStream
+  // ISequentialStream::Read: S_OK when cb bytes were read, S_FALSE when
+  // fewer were because the stream ended. While the stream is still open a
+  // read returns what has arrived (S_OK, possibly fewer than cb) rather than
+  // waiting for cb bytes, so each chunk reaches the page as it is written.
   HRESULT STDMETHODCALLTYPE Read(void *pv, ULONG cb, ULONG *pcbRead) override {
     if (pcbRead) {
       *pcbRead = 0;
     }
     if (!pv && cb > 0) {
-      return STG_E_INVALIDPOINTER;
+      return E_POINTER;
+    }
+    if (cb == 0) {
+      return S_OK; // nothing asked for: never wait
     }
     std::unique_lock<std::mutex> lock{m_mutex};
     m_cv.wait(lock, [this] {
@@ -193,9 +222,6 @@ public:
     if (available == 0) {
       return S_FALSE; // the end, and everything before it has been read
     }
-    if (cb == 0) {
-      return S_OK;
-    }
     auto n = available < static_cast<size_t>(cb) ? available
                                                  : static_cast<size_t>(cb);
     std::memcpy(pv, m_buffer.data() + m_read_pos, n);
@@ -207,7 +233,8 @@ public:
     if (pcbRead) {
       *pcbRead = static_cast<ULONG>(n);
     }
-    return S_OK;
+    // A short read is the end only once nothing more can arrive.
+    return (n < static_cast<size_t>(cb) && m_eof) ? S_FALSE : S_OK;
   }
 
   HRESULT STDMETHODCALLTYPE Write(const void *, ULONG, ULONG *) override {
@@ -260,6 +287,32 @@ private:
     }
   }
 
+  // WebView2 released its last reference to a handed-off stream: unless the
+  // stream already ended, nobody will read it again, so drop what is
+  // buffered now and let the owner forget it (see set_on_abandoned).
+  void on_last_foreign_release() noexcept {
+    std::lock_guard<std::mutex> lock{m_mutex};
+    if (m_eof || m_aborted) {
+      return;
+    }
+    m_aborted = true;
+    m_buffer.clear();
+    m_buffer.shrink_to_fit();
+    m_read_pos = 0;
+    auto fn = std::move(m_on_abandoned);
+    m_on_abandoned = nullptr;
+    if (fn) {
+      try {
+        fn();
+      } catch (...) {
+        // Nothing may unwind out of Release().
+      }
+    }
+    // No reader can be waiting (nobody holds the stream to read it), but
+    // wake any anyway; notify under the lock is harmless.
+    m_cv.notify_all();
+  }
+
   // Drops bytes already read once they are most of the buffer. Under m_mutex.
   void compact() {
     if (m_read_pos > 0 && m_read_pos >= m_buffer.size() / 2) {
@@ -277,6 +330,7 @@ private:
   size_t m_read_pos{};
   bool m_eof{};
   bool m_aborted{};
+  std::function<void()> m_on_abandoned;
 };
 
 } // namespace detail

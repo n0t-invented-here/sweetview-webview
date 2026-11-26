@@ -561,12 +561,13 @@ TEST_CASE("Streaming IStream: push, read, end of stream, abort") {
     REQUIRE(waited >= std::chrono::milliseconds(50));
   }
 
-  // After finish(), what is buffered is still read, then S_FALSE with 0.
+  // After finish(), what is buffered is still read (a short read at the end
+  // is S_FALSE with the bytes), then S_FALSE with 0.
   REQUIRE(stream->push("tail", 4));
   stream->finish();
   REQUIRE(stream->is_closed());
   REQUIRE_FALSE(stream->push("late", 4));
-  REQUIRE(stream->Read(buf, sizeof(buf), &read) == S_OK);
+  REQUIRE(stream->Read(buf, sizeof(buf), &read) == S_FALSE);
   REQUIRE(std::string(buf, read) == "tail");
   REQUIRE(stream->Read(buf, sizeof(buf), &read) == S_FALSE);
   REQUIRE(read == 0);
@@ -599,6 +600,105 @@ TEST_CASE("Streaming IStream: push, read, end of stream, abort") {
   REQUIRE(dropped->buffered() == 0);
   REQUIRE(dropped->Read(buf, sizeof(buf), &read) == E_ABORT);
   dropped->Release();
+}
+
+// ISequentialStream::Read contract: a zero-byte read never waits, a NULL
+// buffer for a non-zero read is E_POINTER, a full read is S_OK, and a short
+// read is S_FALSE only once the stream has ended.
+TEST_CASE("Streaming IStream: Read contract") {
+  using webview::detail::streaming_istream;
+  auto *stream = new streaming_istream{};
+  char buf[8]{};
+  ULONG read = 99;
+
+  // Nothing buffered and not ended: a blocking Read would hang here.
+  auto start = std::chrono::steady_clock::now();
+  REQUIRE(stream->Read(buf, 0, &read) == S_OK);
+  REQUIRE(read == 0);
+  read = 99;
+  REQUIRE(stream->Read(nullptr, 0, &read) == S_OK);
+  REQUIRE(read == 0);
+  REQUIRE(std::chrono::steady_clock::now() - start <
+          std::chrono::milliseconds(500));
+  REQUIRE(stream->Read(nullptr, 4, &read) == E_POINTER);
+  REQUIRE(read == 0);
+
+  // While open, a short read is S_OK: more may still arrive.
+  REQUIRE(stream->push("abcdef", 6));
+  REQUIRE(stream->Read(buf, 4, &read) == S_OK);
+  REQUIRE(read == 4);
+  REQUIRE(stream->Read(buf, sizeof(buf), &read) == S_OK);
+  REQUIRE(std::string(buf, read) == "ef");
+
+  // After finish(): a read that fills the buffer exactly is S_OK, a short
+  // one is S_FALSE with the bytes, and then S_FALSE with none.
+  REQUIRE(stream->push("1234567890", 10));
+  stream->finish();
+  REQUIRE(stream->Read(buf, sizeof(buf), &read) == S_OK);
+  REQUIRE(std::string(buf, read) == "12345678");
+  REQUIRE(stream->Read(buf, sizeof(buf), &read) == S_FALSE);
+  REQUIRE(std::string(buf, read) == "90");
+  REQUIRE(stream->Read(buf, sizeof(buf), &read) == S_FALSE);
+  REQUIRE(read == 0);
+  // A zero-byte read at the end is still S_OK with nothing.
+  REQUIRE(stream->Read(buf, 0, &read) == S_OK);
+  REQUIRE(read == 0);
+  stream->Release();
+}
+
+// When WebView2 releases a handed-off stream before it ends, the stream drops
+// its buffer at once, refuses further chunks, and calls on_abandoned exactly
+// once; a stream that ended first, or was never handed off, does neither.
+TEST_CASE("Streaming IStream: abandoned stream is reclaimed on release") {
+  using webview::detail::streaming_istream;
+  int calls = 0;
+
+  auto *stream = new streaming_istream{};
+  stream->set_on_abandoned([&calls] { ++calls; });
+  REQUIRE(stream->push("buffered and never read", 23));
+  stream->set_handed_off();
+  stream->AddRef(); // WebView2's reference
+  stream->AddRef(); // a second one, released first
+  stream->Release();
+  REQUIRE(calls == 0);
+  REQUIRE(stream->buffered() == 23);
+  stream->Release(); // WebView2 lets go: only the owner's reference is left
+  REQUIRE(calls == 1);
+  REQUIRE(stream->buffered() == 0);
+  REQUIRE(stream->is_closed());
+  REQUIRE(stream->is_abandoned());
+  REQUIRE_FALSE(stream->push("late", 4));
+  char buf[8]{};
+  ULONG read = 0;
+  REQUIRE(stream->Read(buf, sizeof(buf), &read) == E_ABORT);
+  // The owner's own short-lived references do not call it again.
+  stream->AddRef();
+  stream->Release();
+  REQUIRE(calls == 1);
+  stream->Release();
+
+  // Ended before WebView2 let go: the reader got everything, nothing to do.
+  auto *ended = new streaming_istream{};
+  ended->set_on_abandoned([&calls] { ++calls; });
+  REQUIRE(ended->push("x", 1));
+  ended->finish();
+  ended->set_handed_off();
+  ended->AddRef();
+  ended->Release();
+  REQUIRE(calls == 1);
+  REQUIRE(ended->buffered() == 1);
+  ended->Release();
+
+  // Never handed off: the owner's own references coming and going do not
+  // count as WebView2 letting go.
+  auto *kept = new streaming_istream{};
+  kept->set_on_abandoned([&calls] { ++calls; });
+  REQUIRE(kept->push("y", 1));
+  kept->AddRef();
+  kept->Release();
+  REQUIRE(calls == 1);
+  REQUIRE(kept->buffered() == 1);
+  kept->Release();
 }
 
 // Streaming and file drop entry points refuse bad handles and arguments the

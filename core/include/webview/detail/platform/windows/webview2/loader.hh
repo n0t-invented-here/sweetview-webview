@@ -117,6 +117,11 @@ static constexpr IID IID_ICoreWebView2WebResourceRequestedEventHandler{
     0x15F1,
     0x4646,
     {0x80, 0xE8, 0xE7, 0x63, 0x41, 0xD2, 0x5D, 0x71}};
+static constexpr IID IID_ICoreWebView2ContentLoadingEventHandler{
+    0x364471E7,
+    0xF2BE,
+    0x4910,
+    {0xBD, 0xBA, 0xD7, 0x20, 0x77, 0xD5, 0x1C, 0x4B}};
 static constexpr IID
     IID_ICoreWebView2AddScriptToExecuteOnDocumentCreatedCompletedHandler{
         0xB99369F3,
@@ -384,6 +389,10 @@ static constexpr auto permission_requested =
 static constexpr auto web_resource_requested =
     cast_info_t<ICoreWebView2WebResourceRequestedEventHandler>{
         IID_ICoreWebView2WebResourceRequestedEventHandler};
+
+static constexpr auto content_loading =
+    cast_info_t<ICoreWebView2ContentLoadingEventHandler>{
+        IID_ICoreWebView2ContentLoadingEventHandler};
 
 static constexpr auto add_script_to_execute_on_document_created_completed =
     cast_info_t<
