@@ -792,6 +792,8 @@ TEST_CASE("Streaming IStream: concurrent finish and consumer release") {
   }
 }
 
+#endif
+
 // Streaming and file drop entry points refuse bad handles and arguments the
 // same way webview_complete_request does, before touching any instance.
 TEST_CASE("Streaming and file drop C API: argument checks") {
@@ -811,7 +813,6 @@ TEST_CASE("Streaming and file drop C API: argument checks") {
   REQUIRE(webview_end_response(&not_a_webview, 1) ==
           WEBVIEW_ERROR_INVALID_STATE);
 }
-#endif
 
 #include <cstdint>
 #include <limits>

@@ -415,7 +415,23 @@ private:
                       (IMP)(+[](id self, SEL, id, id task) {
                         if (auto w = get_associated_webview(self)) {
                           w->on_url_scheme_task(task);
+                          return;
                         }
+                        // The engine is gone but something still holds the
+                        // WKWebView (a host that retained the view): fail
+                        // the task (NSURLErrorCancelled) rather than leave
+                        // the page's request open forever.
+                        objc::autoreleasepool arp;
+                        objc::msg_send<void>(
+                            task, objc::selector("didFailWithError:"),
+                            objc::msg_send<id>(
+                                objc::get_class("NSError"),
+                                objc::selector(
+                                    "errorWithDomain:code:userInfo:"),
+                                NSString_stringWithUTF8String(
+                                    "NSURLErrorDomain"),
+                                static_cast<NSInteger>(-999),
+                                static_cast<id>(nullptr)));
                       }),
                       "v@:@@");
       // WebKit stops a task when the page no longer wants it. Answering a
@@ -1284,7 +1300,10 @@ private:
 
   // Unregisters the "__webview__" script message handler, so the user content
   // controller drops its strong reference to it and no message posted while
-  // the WKWebView winds down reaches this engine. Safe to call more than once.
+  // the WKWebView winds down reaches this engine. Safe to call more than once,
+  // and safe when the host already unregistered it (a host that calls
+  // removeAllScriptMessageHandlers before webview_destroy): this engine holds
+  // its own reference to the handler until here.
   void remove_script_message_handler() {
     if (!m_script_message_handler) {
       return;

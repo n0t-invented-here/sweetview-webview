@@ -58,6 +58,12 @@ returns.
 - `request_id`: never 0; increases with each request.
 - `headers_json`: the request headers as a JSON array of `[name, value]` string pairs.
 - `body`: the request body, or `NULL`.
+- macOS: WebKit hands a `WKURLSchemeHandler` only the parts of a body the page holds in memory. A
+  body that is a `Blob`, or a `FormData` containing a `File` or `Blob`, arrives empty (`NULL`, 0),
+  from `fetch` and `XMLHttpRequest` alike. Strings, `ArrayBuffer` and typed arrays,
+  `URLSearchParams`, and a `FormData` of text fields arrive whole. A page that uploads files reads
+  them first: `await blob.arrayBuffer()`, or for a form `new Response(formData)`, sending its
+  `arrayBuffer()` with its `Content-Type` header. Windows delivers all of these.
 - Every pointer is valid only for the duration of the call.
 - A request whose body stream fails partway never reaches the handler with a partial body: Windows
   answers it 500, macOS fails the task with the stream's `NSError`.
