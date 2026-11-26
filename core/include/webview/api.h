@@ -174,9 +174,14 @@ WEBVIEW_API webview_error_t webview_set_size(webview_t w, int width, int height,
  *   The host window still needs DWM composition that honors alpha (for
  *   example DwmEnableBlurBehindWindow with an empty region) for true
  *   transparency.
- * - macOS: sets the WKWebView's drawsBackground (KVC) to NO when @p a is 0
- *   and YES otherwise; sets this color as the window's background and makes
- *   the window non-opaque unless @p a is 255.
+ * - macOS: any alpha 0-255. The WKWebView's own background is turned off
+ *   (drawsBackground, KVC, NO) and the color, in sRGB, is painted by the
+ *   WKWebView's backing layer (wantsLayer, layer.backgroundColor) behind the
+ *   page. When @p a is below 255 the window is made non-opaque with a clear
+ *   background, owned or adopted alike, so the translucent layer shows what
+ *   is behind the window. When @p a is 255 only a window this library
+ *   created is made opaque again (with this color as its background); an
+ *   adopted window's opacity and background are left as the host set them.
  * - Linux: accepted; does nothing (see "Linux" in the file overview).
  *
  * @param w The webview instance.
@@ -203,8 +208,14 @@ WEBVIEW_API webview_error_t webview_set_background_color(webview_t w, int r,
  * - Windows: http://webview.localhost (WebView2's WebResourceRequested event;
  *   requests to any other origin are untouched).
  * - macOS: webview://localhost (a WKURLSchemeHandler for the scheme "webview",
- *   registered when the WKWebView is created).
+ *   registered when the WKWebView is created). The authority must be exactly
+ *   "localhost" (any case): webview://other-host/..., a port or userinfo is
+ *   answered 404 and never matches an asset or reaches the request handler.
  * - Linux: accepted and stored; not served (see "Linux" in the file overview).
+ *
+ * Both platforms match the same way: the request URL's raw path (not
+ * percent-decoded; a trailing slash kept), with the query string and
+ * fragment removed and leading slashes ignored, against @p path.
  *
  * Validation, all before anything is stored: @p path and @p mime must not be
  * NULL, @p data may be NULL only when @p len is 0, @p mime must be a valid
@@ -245,6 +256,11 @@ WEBVIEW_API webview_error_t webview_set_asset(webview_t w, const char *path,
  *   example a sandboxed iframe (Windows: http://frames.webview.localhost,
  *   macOS: webview-frames://localhost). Every request to it goes to the
  *   handler.
+ *
+ * Only those exact origins reach the handler. On macOS a request to the
+ * "webview" or "webview-frames" scheme with any other authority (another
+ * host, a port, userinfo) is answered 404 before the asset table or the
+ * handler sees it; on Windows WebView2 only routes the two origins here.
  *
  * Without a handler both answer 404 for anything with no asset. Passing
  * @p fn NULL removes the handler; requests already handed to it stay open
@@ -454,8 +470,9 @@ WEBVIEW_API webview_error_t webview_set_allow_external_drop(webview_t w,
 
 /**
  * Sets the function that receives the real filesystem paths of files dropped
- * on the webview from the operating system (Explorer, Finder). While a
- * handler is set, a drop of files is taken by the webview instead of the page,
+ * on the webview from the operating system (Explorer, Finder). When the
+ * platform captures a file drop while a handler is set (see Remarks for where
+ * and when it does), the drop is taken by the webview instead of the page,
  * and the browser does not navigate to the dropped file. Drags inside the
  * page, and drags that carry no files, are not affected. Passing @p fn NULL
  * removes the handler and restores the page's own handling. Call from the UI
@@ -473,13 +490,16 @@ WEBVIEW_API webview_error_t webview_set_allow_external_drop(webview_t w,
  * handler and argument stay in place and the error is returned.
  *
  * Remarks:
- * - Windows: drops are captured only on the trusted top-level document,
+ * - Windows: drops are captured only on the top-level document,
  *   never inside an iframe (cross-origin or not). The top-level document's
  *   drop event hands the dropped File objects to the host with
  *   chrome.webview.postMessageWithAdditionalObjects, and WebView2's
  *   ICoreWebView2File attachment gives their paths; a drop on an iframe is
  *   left to the iframe and never reaches @p fn. Needs WebView2 Runtime 113
- *   or later.
+ *   or later: on an older Runtime, which lacks
+ *   postMessageWithAdditionalObjects, the drop script neither accepts the
+ *   drag nor prevents the drop, so the drop is left to the page and the
+ *   browser's default instead of being swallowed, and @p fn is not called.
  * - macOS: the engine's WKWebView subclass (SweetviewWKWebView) takes a
  *   drag session when a handler is set, its pasteboard holds file URLs
  *   (public.file-url) and its source allows copying; any other drag goes to

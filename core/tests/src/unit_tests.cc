@@ -927,6 +927,117 @@ TEST_CASE("webview_set_asset: MIME and size validation") {
   REQUIRE(engine.find_asset("a.txt") != nullptr);
 }
 
+// Both backends split request URLs with http_split_request_url, so the
+// raw path (without query or fragment, trailing slash kept) and the exact
+// authority are the same on Windows and macOS.
+TEST_CASE("http_split_request_url: scheme, authority and raw path") {
+  using webview::detail::http_request_url_t;
+  using webview::detail::http_split_request_url;
+  http_request_url_t parts;
+
+  REQUIRE(http_split_request_url("webview://LocalHost/a/b.js?x=1#y", parts));
+  REQUIRE(parts.scheme == "webview");
+  REQUIRE(parts.authority == "localhost");
+  REQUIRE(parts.path == "/a/b.js");
+
+  REQUIRE(http_split_request_url("HTTP://Webview.Localhost/dir/", parts));
+  REQUIRE(parts.scheme == "http");
+  REQUIRE(parts.authority == "webview.localhost");
+  REQUIRE(parts.path == "/dir/");
+
+  // Percent-encoding is kept, not decoded.
+  REQUIRE(http_split_request_url("webview://localhost/a%20b.txt", parts));
+  REQUIRE(parts.path == "/a%20b.txt");
+
+  // No path: "/". Query or fragment straight after the authority.
+  REQUIRE(http_split_request_url("webview://localhost", parts));
+  REQUIRE(parts.authority == "localhost");
+  REQUIRE(parts.path == "/");
+  REQUIRE(http_split_request_url("webview://localhost?q=/x", parts));
+  REQUIRE(parts.authority == "localhost");
+  REQUIRE(parts.path == "/");
+  REQUIRE(http_split_request_url("webview://localhost#/x", parts));
+  REQUIRE(parts.authority == "localhost");
+  REQUIRE(parts.path == "/");
+
+  // Port and userinfo stay in the authority.
+  REQUIRE(http_split_request_url("webview://localhost:8080/i.html", parts));
+  REQUIRE(parts.authority == "localhost:8080");
+  REQUIRE(http_split_request_url("webview://u@localhost/i.html", parts));
+  REQUIRE(parts.authority == "u@localhost");
+
+  // Not a URL: refused, output untouched.
+  parts.scheme = "kept";
+  REQUIRE_FALSE(http_split_request_url("localhost/index.html", parts));
+  REQUIRE_FALSE(http_split_request_url("://localhost/index.html", parts));
+  REQUIRE_FALSE(http_split_request_url("", parts));
+  REQUIRE(parts.scheme == "kept");
+}
+
+// Only the exact origins reach the asset table (main) or the request
+// handler (main or frames); "webview://other-host/..." is neither.
+TEST_CASE("http_classify_request_origin: localhost authority only") {
+  using webview::detail::http_classify_request_origin;
+  using webview::detail::http_request_origin_t;
+  using webview::detail::http_request_url_t;
+  using webview::detail::http_split_request_url;
+  auto classify = [](const char *url) {
+    http_request_url_t parts;
+    REQUIRE(http_split_request_url(url, parts));
+    return http_classify_request_origin(parts);
+  };
+
+  // macOS
+  REQUIRE(classify("webview://localhost/index.html") ==
+          http_request_origin_t::main);
+  REQUIRE(classify("WEBVIEW://LOCALHOST/index.html") ==
+          http_request_origin_t::main);
+  REQUIRE(classify("webview-frames://localhost/f.html") ==
+          http_request_origin_t::frames);
+  REQUIRE(classify("webview://other-host/index.html") ==
+          http_request_origin_t::other);
+  REQUIRE(classify("webview-frames://other-host/f.html") ==
+          http_request_origin_t::other);
+  REQUIRE(classify("webview://localhost:8080/index.html") ==
+          http_request_origin_t::other);
+  REQUIRE(classify("webview://u@localhost/index.html") ==
+          http_request_origin_t::other);
+  REQUIRE(classify("webview:///index.html") == http_request_origin_t::other);
+
+  // Windows
+  REQUIRE(classify("http://webview.localhost/index.html") ==
+          http_request_origin_t::main);
+  REQUIRE(classify("http://frames.webview.localhost/f.html") ==
+          http_request_origin_t::frames);
+  REQUIRE(classify("http://localhost/index.html") ==
+          http_request_origin_t::other);
+  REQUIRE(classify("https://webview.localhost/index.html") ==
+          http_request_origin_t::other);
+  REQUIRE(classify("http://webview.localhost:81/index.html") ==
+          http_request_origin_t::other);
+
+  // Schemes and hosts do not mix across platforms.
+  REQUIRE(classify("webview://webview.localhost/index.html") ==
+          http_request_origin_t::other);
+  REQUIRE(classify("http://localhost/f.html") == http_request_origin_t::other);
+}
+
+// The path a backend extracts finds the same asset on either platform.
+TEST_CASE("find_asset: split request paths match on both platforms") {
+  using webview::detail::http_request_url_t;
+  using webview::detail::http_split_request_url;
+  stub_engine engine;
+  const char body[] = "x";
+  REQUIRE(engine.set_asset("a/b.js", "text/javascript", body, 1).ok());
+  for (const char *url : {"webview://localhost/a/b.js?v=2#top",
+                          "http://webview.localhost/a/b.js?v=2#top",
+                          "webview://localhost//a/b.js"}) {
+    http_request_url_t parts;
+    REQUIRE(http_split_request_url(url, parts));
+    REQUIRE(engine.find_asset(parts.path) != nullptr);
+  }
+}
+
 // A file drop handler the backend refuses leaves the previous one, and the
 // argument it was set with, in place.
 TEST_CASE("set_file_drop_handler: restores the previous handler on failure") {

@@ -32,7 +32,8 @@ typedef void (*webview_file_drop_handler_t)(const char *paths_json, void *arg);
 webview_error_t webview_set_file_drop_handler(webview_t w, webview_file_drop_handler_t fn, void *arg);
 ```
 
-While a handler is set, files dropped from the operating system go to `fn` as a JSON array of real
+When the platform captures a file drop while a handler is set (see the table below for where and
+when it does), the files dropped from the operating system go to `fn` as a JSON array of real
 filesystem paths instead of to the page, and the browser does not navigate to the dropped file. Drags
 inside the page, and drags that carry no files, are not affected. `fn == NULL` removes the handler and
 gives drops back to the page. Call from the UI thread.
@@ -49,7 +50,7 @@ On both Windows and macOS:
 
 | Platform | How                                                                                                                                                                                                                                                                                                                                                                                           |
 | -------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Windows  | Drops are captured only on the trusted top-level document, never inside an `<iframe>` (cross-origin or not). The top-level document's drop event hands the dropped `File` objects to the host with `chrome.webview.postMessageWithAdditionalObjects`, and WebView2's `ICoreWebView2File` attachment gives their paths; a drop on an iframe stays with the iframe. Needs WebView2 Runtime 113 or later |
+| Windows  | Drops are captured only on the top-level document, never inside an `<iframe>` (cross-origin or not). The top-level document's drop event hands the dropped `File` objects to the host with `chrome.webview.postMessageWithAdditionalObjects`, and WebView2's `ICoreWebView2File` attachment gives their paths; a drop on an iframe stays with the iframe. Needs WebView2 Runtime 113 or later: on an older Runtime, which lacks `postMessageWithAdditionalObjects`, the drop script neither accepts the drag nor prevents the drop, so the drop is left to the page and the browser's default instead of being swallowed, and the handler is not called |
 | macOS    | `SweetviewWKWebView` takes a drag session when a handler is set, its pasteboard holds file URLs (`public.file-url`) and its source allows copying (`draggingSourceOperationMask` includes `NSDragOperationCopy`); any other drag goes to WebKit. The paths are read from the pasteboard during `performDragOperation:`. Clearing the handler, or refusing external drops, mid-drag refuses the drop |
 | Linux    | Accepted; does nothing ([why](README.md#linux))                                                                                                                                                                                                                                                                                                                                               |
 

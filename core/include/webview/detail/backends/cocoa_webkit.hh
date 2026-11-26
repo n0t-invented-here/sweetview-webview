@@ -211,24 +211,84 @@ protected:
   }
   noresult set_background_color_impl(int r, int g, int b, int a) override {
     objc::autoreleasepool arp;
+    // m_webview exists from the constructor (window_settings) until the
+    // window closes, so a null here is a browser already gone, not one still
+    // being made: there is nothing to keep for later.
     if (!m_webview) {
       return error_info{WEBVIEW_ERROR_INVALID_STATE, "WebView is null"};
     }
-    // WKWebView has no public API for this on macOS; "drawsBackground" is the
-    // long-standing KVC key Safari-based apps and wry use.
-    NSObject_setValue_forKey(m_webview, NSNumber_numberWithBool(a != 0),
+    // Kept so the SweetviewWKWebView updateLayer override can put the color
+    // back after WebKit's own layer update resets it.
+    m_has_background_color = true;
+    m_bg_r = r;
+    m_bg_g = g;
+    m_bg_b = b;
+    m_bg_a = a;
+    // The color is painted by the WKWebView's own backing layer, behind the
+    // page. WebKit's default (white) background is turned off for every
+    // color, opaque or not, or it would cover the layer. WKWebView has no
+    // public API for that on macOS; "drawsBackground" is the long-standing
+    // KVC key Safari-based apps and wry use.
+    NSObject_setValue_forKey(m_webview, NSNumber_numberWithBool(false),
                              NSString_stringWithUTF8String("drawsBackground"));
+    objc::msg_send<void>(m_webview, objc::selector("setWantsLayer:"),
+                         static_cast<BOOL>(true));
+    apply_layer_background_color();
+    objc::msg_send<void>(m_webview, objc::selector("setNeedsDisplay:"),
+                         static_cast<BOOL>(true));
+    // Autoreleased NSColor for the owned window's opaque background below.
+    auto color = objc::msg_send<id>(
+        objc::get_class("NSColor"),
+        objc::selector("colorWithSRGBRed:green:blue:alpha:"),
+        static_cast<CGFloat>(r / 255.0), static_cast<CGFloat>(g / 255.0),
+        static_cast<CGFloat>(b / 255.0), static_cast<CGFloat>(a / 255.0));
     if (m_window) {
-      auto color = objc::msg_send<id>(
-          objc::get_class("NSColor"),
-          objc::selector("colorWithRed:green:blue:alpha:"), r / 255.0,
-          g / 255.0, b / 255.0, a / 255.0);
-      objc::msg_send<void>(m_window, objc::selector("setOpaque:"),
-                           static_cast<BOOL>(a == 255));
-      objc::msg_send<void>(m_window, objc::selector("setBackgroundColor:"),
-                           color);
+      if (a < 255) {
+        // A translucent layer shows what is behind it only when the window
+        // itself is clear, owned or adopted alike.
+        objc::msg_send<void>(m_window, objc::selector("setOpaque:"),
+                             static_cast<BOOL>(false));
+        objc::msg_send<void>(
+            m_window, objc::selector("setBackgroundColor:"),
+            objc::msg_send<id>(objc::get_class("NSColor"),
+                               objc::selector("clearColor")));
+      } else if (owns_window()) {
+        // An opaque color restores opacity only on a window this library
+        // made; an adopted window's own transparency settings are the
+        // host's and are left as they are.
+        objc::msg_send<void>(m_window, objc::selector("setOpaque:"),
+                             static_cast<BOOL>(true));
+        objc::msg_send<void>(m_window, objc::selector("setBackgroundColor:"),
+                             color);
+      }
     }
     return {};
+  }
+
+  // Puts the stored background color on the WKWebView's backing layer.
+  // Called from set_background_color_impl and after every WebKit
+  // updateLayer pass, which resets the layer's backgroundColor.
+  void apply_layer_background_color() {
+    if (!m_has_background_color || !m_webview) {
+      return;
+    }
+    objc::autoreleasepool arp;
+    auto layer = objc::msg_send<id>(m_webview, objc::selector("layer"));
+    if (!layer) {
+      return;
+    }
+    // Autoreleased NSColor; its CGColor lives as long as it does (this
+    // pool), and the layer retains what it is given.
+    auto color = objc::msg_send<id>(
+        objc::get_class("NSColor"),
+        objc::selector("colorWithSRGBRed:green:blue:alpha:"),
+        static_cast<CGFloat>(m_bg_r / 255.0),
+        static_cast<CGFloat>(m_bg_g / 255.0),
+        static_cast<CGFloat>(m_bg_b / 255.0),
+        static_cast<CGFloat>(m_bg_a / 255.0));
+    objc::msg_send<void>(
+        layer, objc::selector("setBackgroundColor:"),
+        objc::msg_send<void *>(color, objc::selector("CGColor")));
   }
 
   noresult set_size_impl(int width, int height, webview_hint_t hints) override {
@@ -470,18 +530,29 @@ private:
     objc::autoreleasepool arp;
     auto request = objc::msg_send<id>(task, objc::selector("request"));
     auto url = objc::msg_send<id>(request, objc::selector("URL"));
-    auto scheme = nsstring_to_string(
-        objc::msg_send<id>(url, objc::selector("scheme")));
-    for (auto &c : scheme) {
-      c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    auto url_string = nsstring_to_string(
+        objc::msg_send<id>(url, objc::selector("absoluteString")));
+
+    // Split and matched the same way as on Windows (http_split_request_url):
+    // the scheme and the exact authority "localhost" pick the origin, and
+    // the raw path (not NSURL's percent-decoded path, which also drops a
+    // trailing slash) without query or fragment is looked up. Any other
+    // authority ("webview://other-host/index.html", a port, userinfo) is
+    // refused here, before the asset table or the request handler.
+    http_request_url_t parts;
+    auto origin_kind = http_split_request_url(url_string, parts)
+                           ? http_classify_request_origin(parts)
+                           : http_request_origin_t::other;
+    if (origin_kind == http_request_origin_t::other) {
+      http_headers_t headers{{"Content-Type", "text/plain"},
+                             {"Content-Length", "0"}};
+      respond_to_url_scheme_task(task, url, 404, headers, nullptr, 0);
+      return;
     }
-    bool is_frames_origin = scheme == "webview-frames";
 
     // The asset table answers the main origin first, at no extra cost.
-    if (!is_frames_origin) {
-      auto path =
-          nsstring_to_string(objc::msg_send<id>(url, objc::selector("path")));
-      if (auto *asset = find_asset(path)) {
+    if (origin_kind == http_request_origin_t::main) {
+      if (auto *asset = find_asset(parts.path)) {
         http_headers_t headers{
             {"Content-Type", asset->mime},
             {"Content-Length", std::to_string(asset->data.size())}};
@@ -504,8 +575,6 @@ private:
     if (method.empty()) {
       method = "GET";
     }
-    auto url_string = nsstring_to_string(
-        objc::msg_send<id>(url, objc::selector("absoluteString")));
 
     http_headers_t request_headers;
     auto fields =
@@ -919,6 +988,23 @@ private:
           }
         }),
         "v@:@");
+    // WebKit's own updateLayer resets the layer's backgroundColor, so a
+    // custom background color set once would be lost on the next layer
+    // update; it is re-applied after WebKit's pass every time.
+    add_drag_method(
+        "updateLayer", (IMP)(+[](id self, SEL sel) {
+          struct objc_super super_info {
+            self, objc::get_class("WKWebView")
+          };
+          objc::invoke<void>(objc_msgSendSuper, &super_info, sel);
+          try {
+            if (auto w = get_associated_webview(self)) {
+              w->apply_layer_background_color();
+            }
+          } catch (...) {
+          }
+        }),
+        "v@:");
     objc_registerClassPair(cls);
     return cls;
   }
@@ -1557,6 +1643,14 @@ private:
   // Route of every drag session currently over the WKWebView, by
   // NSDraggingInfo.draggingSequenceNumber; main thread only.
   std::map<NSInteger, drag_route_t> m_drag_routes;
+  // The last color given to set_background_color, re-applied to the
+  // WKWebView's layer after each of WebKit's updateLayer passes; main
+  // thread only.
+  bool m_has_background_color{false};
+  int m_bg_r{0};
+  int m_bg_g{0};
+  int m_bg_b{0};
+  int m_bg_a{255};
   // The "__webview__" script message handler (owned by m_manager).
   id m_script_message_handler{};
   id m_url_scheme_handler{};

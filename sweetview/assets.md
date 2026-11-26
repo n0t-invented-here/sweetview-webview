@@ -29,6 +29,10 @@ The origin is fixed per platform:
 
 - `path`: the URL path without the leading slash; must not need percent-encoding. A request's query
   string and fragment are ignored when matching.
+- Matching is the same on both platforms: the request URL's raw path (not percent-decoded; a
+  trailing slash kept), query string and fragment removed, leading slashes ignored.
+- On macOS the authority must be exactly `localhost` (any case): `webview://other-host/index.html`,
+  a port or userinfo is answered 404 and never matches an asset.
 - `mime`: the value of the `Content-Type` header.
 
 Validation, all before anything is stored (the asset table is left as it was on failure):

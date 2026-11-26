@@ -39,6 +39,10 @@ Two origins go to the handler:
 - The frames origin is for content that must be cross-origin from the page, such as a sandboxed
   `<iframe>`: the browser keeps the page out of its document, and the two talk through `postMessage`.
 - Without a handler, both answer 404 for anything with no asset.
+- Only those exact origins reach the handler. On macOS a request to the `webview` or
+  `webview-frames` scheme with any other authority (`webview://other-host/...`, a port, userinfo)
+  is answered 404 before the asset table or the handler sees it; on Windows WebView2 routes only
+  the two origins here.
 - Windows: where the WebView2 Runtime has `ICoreWebView2_22` (Runtime 122.0.2365.46 or later; the
   interface shipped in SDK 1.0.2365.46, and this build is configured with SDK 1.0.2478.35), the filters
   are added with `AddWebResourceRequestedFilterWithRequestSourceKinds` and all source kinds, so they

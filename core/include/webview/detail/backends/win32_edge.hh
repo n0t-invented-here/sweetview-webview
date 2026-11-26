@@ -1005,21 +1005,22 @@ protected:
     }
     std::string url = uri.narrow();
 
-    // The path is everything from the first '/' after "scheme://host".
-    auto path_start = url.find("://");
-    path_start = path_start == std::string::npos
-                     ? std::string::npos
-                     : url.find('/', path_start + 3);
-    std::string origin =
-        path_start == std::string::npos ? url : url.substr(0, path_start);
-    for (auto &c : origin) {
-      c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    // Split and matched the same way as on macOS (http_split_request_url):
+    // the raw path without query or fragment, and the exact authority.
+    http_request_url_t parts;
+    auto origin_kind = http_split_request_url(url, parts)
+                           ? http_classify_request_origin(parts)
+                           : http_request_origin_t::other;
+    if (origin_kind == http_request_origin_t::other) {
+      // The filters admit only the two origins; anything else is refused
+      // rather than handed to the request handler.
+      put_response(args, 404, L"", std::string{});
+      return;
     }
-    bool is_frames_origin = origin == "http://frames.webview.localhost";
 
     // The asset table answers the main origin first, at no extra cost.
-    if (!is_frames_origin && path_start != std::string::npos) {
-      if (auto *asset = find_asset(url.substr(path_start))) {
+    if (origin_kind == http_request_origin_t::main) {
+      if (auto *asset = find_asset(parts.path)) {
         put_response(args, 200, widen_string("Content-Type: " + asset->mime),
                      asset->data);
         return;
@@ -1390,7 +1391,10 @@ protected:
   // that carries files is accepted (dragover) and its drop is kept from the
   // browser's default (opening the file) and posted to the host with the
   // File objects, whose paths WebView2 reveals only to the host. Page
-  // listeners still see both events.
+  // listeners still see both events. On a WebView2 Runtime older than 113,
+  // which lacks postMessageWithAdditionalObjects, nothing is accepted or
+  // prevented: a drop the host could never receive is left to the page and
+  // the browser's default rather than swallowed.
   static std::string create_file_drop_script() {
     return "(function() {\n\
   'use strict';\n\
@@ -1400,9 +1404,14 @@ protected:
   if (typeof window.__webview_file_drop_enabled__ !== 'boolean') {\n\
     window.__webview_file_drop_enabled__ = false;\n\
   }\n\
+  function canDeliver() {\n\
+    return !!(window.chrome && window.chrome.webview &&\n\
+      typeof window.chrome.webview.postMessageWithAdditionalObjects ===\n\
+        'function');\n\
+  }\n\
   function carriesFiles(e) {\n\
-    return !!(window.__webview_file_drop_enabled__ && e.dataTransfer &&\n\
-      e.dataTransfer.types &&\n\
+    return !!(window.__webview_file_drop_enabled__ && canDeliver() &&\n\
+      e.dataTransfer && e.dataTransfer.types &&\n\
       Array.from(e.dataTransfer.types).includes('Files'));\n\
   }\n\
   window.addEventListener('dragover', function(e) {\n\
@@ -1415,9 +1424,7 @@ protected:
       return;\n\
     }\n\
     e.preventDefault();\n\
-    if (e.dataTransfer.files && e.dataTransfer.files.length &&\n\
-        window.chrome && window.chrome.webview &&\n\
-        window.chrome.webview.postMessageWithAdditionalObjects) {\n\
+    if (e.dataTransfer.files && e.dataTransfer.files.length) {\n\
       window.chrome.webview.postMessageWithAdditionalObjects(\n\
         '__sweetview_file_drop__', Array.from(e.dataTransfer.files));\n\
     }\n\

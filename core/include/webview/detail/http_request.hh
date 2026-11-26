@@ -33,6 +33,7 @@
 
 #include "json.hh"
 
+#include <cctype>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -592,6 +593,87 @@ inline const char *http_reason_phrase(int status) {
     return "Server Error";
   }
   return "Unknown";
+}
+
+// The parts of a request URL ("scheme://authority/path?query#fragment") the
+// backends route on, taken from the URL string itself so every platform
+// matches the same way:
+// - scheme: lowercased.
+// - authority: everything between "://" and the first '/', '?' or '#',
+//   lowercased. A port or userinfo stays in it, so "localhost:8080" is not
+//   "localhost".
+// - path: raw (not percent-decoded) from the first '/' after the authority
+//   up to the first '?' or '#'; "/" when the URL has no path. A trailing
+//   slash is kept (NSURL's path would drop it).
+struct http_request_url_t {
+  std::string scheme;
+  std::string authority;
+  std::string path;
+};
+
+// Splits `url` into `out`; false (and `out` untouched) when `url` has no
+// "://" or an empty scheme.
+inline bool http_split_request_url(const std::string &url,
+                                   http_request_url_t &out) {
+  auto scheme_end = url.find("://");
+  if (scheme_end == std::string::npos || scheme_end == 0) {
+    return false;
+  }
+  auto authority_start = scheme_end + 3;
+  auto authority_end = url.find_first_of("/?#", authority_start);
+  if (authority_end == std::string::npos) {
+    authority_end = url.size();
+  }
+  std::string path;
+  if (authority_end < url.size() && url[authority_end] == '/') {
+    auto path_end = url.find_first_of("?#", authority_end);
+    path = url.substr(authority_end, path_end == std::string::npos
+                                         ? std::string::npos
+                                         : path_end - authority_end);
+  } else {
+    path = "/";
+  }
+  auto lower = [](std::string s) {
+    for (auto &c : s) {
+      c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    return s;
+  };
+  out.scheme = lower(url.substr(0, scheme_end));
+  out.authority =
+      lower(url.substr(authority_start, authority_end - authority_start));
+  out.path = std::move(path);
+  return true;
+}
+
+// Which of the webview's own origins a request URL belongs to. The main
+// origin is answered from the asset table first; the frames origin only by
+// the request handler.
+enum class http_request_origin_t { other, main, frames };
+
+// Windows: http://webview.localhost and http://frames.webview.localhost.
+// macOS: webview://localhost and webview-frames://localhost. Any other
+// scheme, or any other authority (another host, a port, userinfo), is
+// `other`, so "webview://other-host/index.html" never reaches the asset
+// table.
+inline http_request_origin_t
+http_classify_request_origin(const http_request_url_t &url) {
+  if (url.scheme == "http") {
+    if (url.authority == "webview.localhost") {
+      return http_request_origin_t::main;
+    }
+    if (url.authority == "frames.webview.localhost") {
+      return http_request_origin_t::frames;
+    }
+  } else if (url.authority == "localhost") {
+    if (url.scheme == "webview") {
+      return http_request_origin_t::main;
+    }
+    if (url.scheme == "webview-frames") {
+      return http_request_origin_t::frames;
+    }
+  }
+  return http_request_origin_t::other;
 }
 
 } // namespace detail
