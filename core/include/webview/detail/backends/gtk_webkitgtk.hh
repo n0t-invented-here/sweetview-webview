@@ -111,6 +111,7 @@ public:
   gtk_webkit_engine &operator=(gtk_webkit_engine &&) = delete;
 
   virtual ~gtk_webkit_engine() {
+    mark_destroying();
     if (m_window) {
       if (owns_window()) {
         // Disconnect handlers to avoid callbacks invoked during destruction.

@@ -61,6 +61,13 @@ inline void NSApplication_run(id self) {
   objc::msg_send<void>(self, objc::selector("run"));
 }
 
+// True once the app's main run loop has started ([NSApp run] or the host's
+// own NSApplicationMain).
+inline bool NSApplication_isRunning(id self) {
+  return static_cast<bool>(
+      objc::msg_send<BOOL>(self, objc::selector("isRunning")));
+}
+
 inline void NSApplication_stop(id self, id sender = nullptr) {
   objc::msg_send<void>(self, objc::selector("stop:"), sender);
 }

@@ -395,7 +395,15 @@ Here are some of the noteworthy ways our implementation of the loader differs fr
 
 Since library functions generally do not have thread safety guarantees, `webview_dispatch()` (C) / `webview::dispatch()` (C++) can be used to schedule code to execute on the main/GUI thread and thereby make that execution safe in multi-threaded applications.
 
-`webview_return()` (C) / `webview::resolve()` (C++) uses `*dispatch()` internally and is therefore safe to call from another thread.
+`webview_return()` (C) / `webview::resolve()` (C++) uses `*dispatch()` internally and is therefore safe to call from another thread. A reply still queued when the webview is destroyed is dropped.
+
+### Binding calls
+
+A call from the page to a function bound with `webview_bind()` is queued for the GUI thread. If `webview_unbind()` removes the binding (or it is removed and bound again under the same name) before the queued call runs, the callback is not called and the page's promise is rejected; the callback's `arg` may be freed as soon as `webview_unbind()` returns. `webview_bind()` returns `WEBVIEW_ERROR_DUPLICATE` for a name already bound (the existing binding stays) and `webview_unbind()` returns `WEBVIEW_ERROR_NOT_FOUND` for a name not bound.
+
+The `result` passed to `webview_return()` must be JSON; an empty string settles the page's promise with `undefined`. Status 0 resolves it with the parsed value, any other status rejects it with that value. A result that is not valid JSON rejects the promise with an `Error`. Each call is answered at most once: replies for an id already settled, or not known to the page, are ignored.
+
+`webview_destroy()` returns `WEBVIEW_ERROR_INVALID_STATE` for a handle already destroyed, and `webview_dispatch()` returns it for a destroyed (or being destroyed) handle, without touching the freed instance.
 
 The main/GUI thread should be the thread that calls `webview_run()` (C) / `webview::run()` (C++).
 

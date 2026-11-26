@@ -653,8 +653,17 @@ protected:
     }
     return error_info{WEBVIEW_ERROR_INVALID_STATE};
   }
+  // PostQuitMessage only affects the calling thread's queue, so a call from
+  // any other thread is sent to the UI thread that runs the event loop.
   noresult terminate_impl() override {
-    PostQuitMessage(0);
+    if (GetCurrentThreadId() == m_main_thread) {
+      PostQuitMessage(0);
+      return {};
+    }
+    if (!PostThreadMessageW(m_main_thread, WM_QUIT, 0, 0)) {
+      return error_info{WEBVIEW_ERROR_UNSPECIFIED,
+                        "PostThreadMessageW failed"};
+    }
     return {};
   }
   // Queues f and posts one WM_APP per entry; the message window runs the
@@ -1523,6 +1532,10 @@ protected:
   }
 
   noresult navigate_impl(const std::string &url) override {
+    if (!m_webview) {
+      return error_info{WEBVIEW_ERROR_INVALID_STATE,
+                        "webview is not initialized"};
+    }
     auto wurl = widen_string(url);
     m_webview->Navigate(wurl.c_str());
     return {};
@@ -1531,33 +1544,57 @@ protected:
   noresult eval_impl(const std::string &js) override {
     // TODO: Skip if no content has begun loading yet. Can't check with
     //       ICoreWebView2::get_Source because it returns "about:blank".
+    if (!m_webview) {
+      return error_info{WEBVIEW_ERROR_INVALID_STATE,
+                        "webview is not initialized"};
+    }
     auto wjs = widen_string(js);
     m_webview->ExecuteScript(wjs.c_str(), nullptr);
     return {};
   }
 
   noresult set_html_impl(const std::string &html) override {
+    if (!m_webview) {
+      return error_info{WEBVIEW_ERROR_INVALID_STATE,
+                        "webview is not initialized"};
+    }
     m_webview->NavigateToString(widen_string(html).c_str());
     return {};
   }
 
   user_script add_user_script_impl(const std::string &js) override {
     auto wjs = widen_string(js);
-    std::wstring script_id;
-    bool done{};
-    webview2_user_script_added_handler handler{[&](HRESULT res, LPCWSTR id) {
-      if (SUCCEEDED(res)) {
-        script_id = id;
-      }
-      done = true;
-    }};
+    // The completion may arrive after the nested pump below has given up
+    // (WM_QUIT, GetMessageW failure), so neither the handler nor what it
+    // writes lives on this stack: both are heap-owned and outlive the call.
+    struct add_state {
+      std::atomic<bool> done{false};
+      std::wstring script_id;
+      HRESULT hr{E_FAIL};
+    };
+    auto state = std::make_shared<add_state>();
+    if (!m_webview) {
+      return user_script{
+          js, user_script::impl_ptr{new user_script::impl{{}, wjs},
+                                    [](user_script::impl *p) { delete p; }}};
+    }
+    auto *handler =
+        new webview2_user_script_added_handler{[state](HRESULT res, LPCWSTR id) {
+          state->hr = res;
+          if (SUCCEEDED(res) && id) {
+            state->script_id = id;
+          }
+          state->done.store(true);
+        }};
     auto res =
-        m_webview->AddScriptToExecuteOnDocumentCreated(wjs.c_str(), &handler);
+        m_webview->AddScriptToExecuteOnDocumentCreated(wjs.c_str(), handler);
+    // WebView2 holds its own reference while the call is pending.
+    handler->Release();
     if (SUCCEEDED(res)) {
       // We want to guard against executing the default `set_size` prematurely
       set_default_size_guard(true);
       // Sadly we need to pump the event loop in order to get the script ID.
-      run_event_loop_while([&] { return !done; });
+      run_event_loop_while([state] { return !state->done.load(); });
       // The user's `set_size` may have been executed from the depleted event queue,
       // and if so, guard against putting the default `set_size` back onto the queue.
       if (!m_is_window_shown) {
@@ -1567,6 +1604,10 @@ protected:
     }
     // TODO: There's a non-zero chance that we didn't get the script ID.
     //       We need to convey the error somehow.
+    std::wstring script_id;
+    if (state->done.load()) {
+      script_id = state->script_id;
+    }
     return user_script{
         js, user_script::impl_ptr{new user_script::impl{script_id, wjs},
                                   [](user_script::impl *p) { delete p; }}};
@@ -1576,7 +1617,9 @@ protected:
   remove_all_user_scripts_impl(const std::list<user_script> &scripts) override {
     for (const auto &script : scripts) {
       const auto &id = script.get_impl().get_id();
-      m_webview->RemoveScriptToExecuteOnDocumentCreated(id.c_str());
+      if (m_webview && !id.empty()) {
+        m_webview->RemoveScriptToExecuteOnDocumentCreated(id.c_str());
+      }
     }
   }
 
@@ -1964,9 +2007,20 @@ private:
     }
   }
 
+  // Nested pump. A WM_QUIT seen here is posted again so the outer event loop
+  // (run_impl or the host's) still receives it; a GetMessageW error ends the
+  // pump.
   void run_event_loop_while(std::function<bool()> fn) override {
     MSG msg;
-    while (fn() && GetMessageW(&msg, nullptr, 0, 0) > 0) {
+    while (fn()) {
+      auto got = GetMessageW(&msg, nullptr, 0, 0);
+      if (got == 0) {
+        PostQuitMessage(static_cast<int>(msg.wParam));
+        return;
+      }
+      if (got < 0) {
+        return;
+      }
       TranslateMessage(&msg);
       DispatchMessageW(&msg);
     }

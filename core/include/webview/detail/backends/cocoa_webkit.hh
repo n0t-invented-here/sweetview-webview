@@ -116,20 +116,7 @@ public:
     // Answers webview_complete_request queued on the main queue do nothing
     // from here on, even those that run after this engine is deleted.
     mark_destroying();
-    if (m_url_scheme_handler) {
-      // WebKit may still start or stop tasks on the handler while the
-      // WKWebView winds down; they must not reach this engine.
-      set_associated_webview(m_url_scheme_handler, nullptr);
-      objc::release(m_url_scheme_handler);
-      m_url_scheme_handler = nullptr;
-    }
-    // Tasks still open are only released: WebKit stops them itself when the
-    // WKWebView goes, and answering one it has stopped would throw.
-    for (auto &entry : m_pending_tasks) {
-      objc::release(entry.second);
-    }
-    m_pending_tasks.clear();
-    m_streaming_tasks.clear();
+    release_url_scheme_state();
     if (m_window && m_widget &&
         m_widget == NSWindow_get_contentView(m_window)) {
       NSWindow_set_contentView(m_window, nullptr);
@@ -388,10 +375,18 @@ private:
       cls =
           objc_allocateClassPair(objc::get_class("NSResponder"), class_name, 0);
       class_addProtocol(cls, objc_getProtocol("NSTouchBarProvider"));
+      // BOOL is a C bool on arm64 and a signed char on x86_64; the type
+      // encoding must say which.
+#if defined(__arm64__) || defined(__aarch64__)
+      constexpr auto should_terminate_types = "B@:@";
+#else
+      constexpr auto should_terminate_types = "c@:@";
+#endif
       class_addMethod(
           cls,
           objc::selector("applicationShouldTerminateAfterLastWindowClosed:"),
-          (IMP)(+[](id, SEL, id) -> BOOL { return NO; }), "c@:@");
+          (IMP)(+[](id, SEL, id) -> BOOL { return NO; }),
+          should_terminate_types);
       class_addMethod(cls, objc::selector("applicationDidFinishLaunching:"),
                       (IMP)(+[](id self, SEL, id notification) {
                         auto app{NSNotification_get_object(notification)};
@@ -945,8 +940,9 @@ private:
               if (paths.empty()) {
                 return NO;
               }
-              w->schedule_file_drop(std::move(paths));
-              return YES;
+              // NO when the delivery timer could not be made: the drop
+              // would otherwise be accepted and then never delivered.
+              return w->schedule_file_drop(std::move(paths)) ? YES : NO;
             }
             case drag_route_t::webkit:
               if (!w->m_allow_external_drop.load() &&
@@ -1014,7 +1010,8 @@ private:
   // whose teardown waits for a block queued on the main queue, and a block
   // already running on that serial queue would never let it run. Nothing is
   // called once the engine is being destroyed.
-  void schedule_file_drop(std::vector<std::string> paths) {
+  // False when the timer could not be created; nothing is scheduled then.
+  bool schedule_file_drop(std::vector<std::string> paths) {
     struct pending_drop {
       cocoa_wkwebview_engine *w;
       std::shared_ptr<std::atomic<bool>> alive;
@@ -1043,12 +1040,13 @@ private:
         &context);
     if (!timer) {
       delete drop;
-      return;
+      return false;
     }
     auto main_loop = CFRunLoopGetMain();
     CFRunLoopAddTimer(main_loop, timer, kCFRunLoopCommonModes);
     CFRelease(timer); // the run loop holds it until it fires
     CFRunLoopWakeUp(main_loop);
+    return true;
   }
 
   static NSInteger drag_sequence(id sender) {
@@ -1297,7 +1295,27 @@ private:
       WKUserContentController_removeScriptMessageHandlerForName(
           m_manager, NSString_stringWithUTF8String("__webview__"));
     }
+    objc::release(m_script_message_handler);
     m_script_message_handler = nullptr;
+  }
+
+  // Cuts the URL scheme handler off from this engine and releases every task
+  // still open: from windowWillClose: and from the destructor. Tasks are only
+  // released: WebKit stops them itself when the WKWebView goes, and answering
+  // one it has stopped would throw. Idempotent.
+  void release_url_scheme_state() {
+    if (m_url_scheme_handler) {
+      // WebKit may still start or stop tasks on the handler while the
+      // WKWebView winds down; they must not reach this engine.
+      set_associated_webview(m_url_scheme_handler, nullptr);
+      objc::release(m_url_scheme_handler);
+      m_url_scheme_handler = nullptr;
+    }
+    for (auto &entry : m_pending_tasks) {
+      objc::release(entry.second);
+    }
+    m_pending_tasks.clear();
+    m_streaming_tasks.clear();
   }
 
   // Cuts every view and controller this engine created off from it and
@@ -1315,13 +1333,19 @@ private:
       m_manager = nullptr;
     }
     m_drag_routes.clear();
+    if (m_ui_delegate) {
+      // The host may have replaced the UI delegate; that one belongs to the
+      // host and is neither cleared nor released here. Only the engine's own
+      // delegate (held +1 in m_ui_delegate) is released.
+      if (m_webview && WKWebView_get_UIDelegate(m_webview) == m_ui_delegate) {
+        WKWebView_set_UIDelegate(m_webview, nullptr);
+      }
+      set_associated_webview(m_ui_delegate, nullptr);
+      objc::release(m_ui_delegate);
+      m_ui_delegate = nullptr;
+    }
     if (m_webview) {
       set_associated_webview(m_webview, nullptr);
-      if (auto ui_delegate{WKWebView_get_UIDelegate(m_webview)}) {
-        WKWebView_set_UIDelegate(m_webview, nullptr);
-        set_associated_webview(ui_delegate, nullptr);
-        objc::release(ui_delegate);
-      }
       objc::release(m_webview);
       m_webview = nullptr;
     }
@@ -1448,7 +1472,11 @@ private:
   }
   void on_window_will_close(id /*delegate*/, id /*window*/) {
     // The window keeps the views alive until it goes; this engine lets go of
-    // them now so nothing left behind still points at it.
+    // them now so nothing left behind still points at it. From here on
+    // queued answers, replies and file drops do nothing, and no URL scheme
+    // task can reach this engine.
+    mark_destroying();
+    release_url_scheme_state();
     detach_and_release_views();
     m_window = nullptr;
     dispatch([this] { on_window_destroyed(); });
@@ -1501,7 +1529,9 @@ private:
 #error __has_builtin not supported by compiler
 #endif
 
-    auto ui_delegate = create_webkit_ui_delegate();
+    // Held +1 by the engine (WKWebView's UIDelegate is weak) and released in
+    // detach_and_release_views().
+    m_ui_delegate = create_webkit_ui_delegate();
     // A WKWebView subclass, so files dropped from Finder can be taken
     // before the page sees them (see webview_set_file_drop_handler).
     m_webview = objc::retain(objc::autorelease(WKWebView_initWithFrame(
@@ -1514,8 +1544,8 @@ private:
         NSViewWidthSizable | NSViewMaxXMargin | NSViewHeightSizable |
         NSViewMaxYMargin)};
     NSView_set_autoresizingMask(m_webview, autoresizing_mask);
-    set_associated_webview(ui_delegate, this);
-    WKWebView_set_UIDelegate(m_webview, ui_delegate);
+    set_associated_webview(m_ui_delegate, this);
+    WKWebView_set_UIDelegate(m_webview, m_ui_delegate);
 
     if (debug) {
       // Explicitly make WKWebView inspectable via Safari on OS versions that
@@ -1527,13 +1557,11 @@ private:
       WKWebView_set_inspectable(m_webview, true);
     }
 
-    auto script_message_handler =
-        objc::autorelease(create_script_message_handler());
-    // Unretained: the user content controller holds it until
-    // remove_script_message_handler() unregisters it.
-    m_script_message_handler = script_message_handler;
+    // Held +1 by the engine (and by the user content controller while
+    // registered) until remove_script_message_handler() releases it.
+    m_script_message_handler = create_script_message_handler();
     WKUserContentController_addScriptMessageHandler(
-        m_manager, script_message_handler,
+        m_manager, m_script_message_handler,
         NSString_stringWithUTF8String("__webview__"));
 
     add_init_script("function(message) {\n\
@@ -1581,8 +1609,10 @@ private:
     }
 
     // Skip application setup if this isn't the first instance of this class
-    // because the launch event is only sent once.
-    if (!get_and_set_is_first_instance()) {
+    // because the launch event is only sent once. The same holds when the
+    // host has already launched the app (its run loop is running): the
+    // launch event will never come again, so a nested run would hang.
+    if (!get_and_set_is_first_instance() || NSApplication_isRunning(m_app)) {
       window_init_proceed();
       return;
     }
@@ -1651,8 +1681,11 @@ private:
   int m_bg_g{0};
   int m_bg_b{0};
   int m_bg_a{255};
-  // The "__webview__" script message handler (owned by m_manager).
+  // The "__webview__" script message handler; retained by the engine.
   id m_script_message_handler{};
+  // The engine's own WKUIDelegate; retained by the engine. Never confused
+  // with a delegate the host set on the WKWebView later.
+  id m_ui_delegate{};
   id m_url_scheme_handler{};
   // Tasks handed to the request handler and not yet answered or stopped;
   // each is retained.

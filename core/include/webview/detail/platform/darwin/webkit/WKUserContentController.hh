@@ -55,7 +55,7 @@ inline void WKUserContentController_addUserScript(id self, id user_script) {
 }
 
 inline void WKUserContentController_removeAllUserScripts(id self) {
-  objc::msg_send<id>(self, objc::selector("removeAllUserScripts"));
+  objc::msg_send<void>(self, objc::selector("removeAllUserScripts"));
 }
 
 } // namespace webkit

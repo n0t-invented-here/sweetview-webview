@@ -8,7 +8,7 @@ endmacro()
 macro(webview_find_dependencies)
     if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
         # ApplicationServices: CoreGraphics event taps and the Accessibility check behind webview_mouse_hook_install
-        list(APPEND WEBVIEW_DEPENDENCIES "-framework WebKit" "-framework ApplicationServices" dl)
+        list(APPEND WEBVIEW_DEPENDENCIES "-framework WebKit" "-framework ApplicationServices" "-framework CoreFoundation" dl)
     elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         find_package(PkgConfig REQUIRED)
 

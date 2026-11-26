@@ -639,9 +639,10 @@ WEBVIEW_API webview_error_t webview_permission_status(unsigned permission);
 
 /**
  * Asks the system for a permission. On macOS it adds the app to the row in
- * System Settings > Privacy & Security and shows its dialog each time this
- * is called while the permission is missing; the user grants it there, and
- * an install after that succeeds. On a platform without the permission
+ * System Settings > Privacy & Security; whether a prompt appears is up to
+ * macOS (it may show none, for example after the user dismissed one). The
+ * user grants it there, and an install after that succeeds. On a platform
+ * without the permission
  * nothing is shown.
  *
  * @param permission One @c webview_permission_t.

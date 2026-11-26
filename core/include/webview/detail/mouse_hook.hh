@@ -234,7 +234,12 @@ inline noresult remove() {
   if (!s.fn) {
     return error_info{WEBVIEW_ERROR_NOT_FOUND, "No mouse hook is installed"};
   }
-  UnhookWindowsHookEx(s.hook);
+  // On failure the hook is still installed and still calls fn, so the
+  // state stays as it is and the caller learns the callback is still live.
+  if (!UnhookWindowsHookEx(s.hook)) {
+    return error_info{WEBVIEW_ERROR_UNSPECIFIED,
+                      "UnhookWindowsHookEx(WH_MOUSE_LL) failed"};
+  }
   s = state_t{};
   return {};
 }

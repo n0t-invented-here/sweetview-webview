@@ -314,3 +314,14 @@ TEST_CASE("Bad C API usage without crash") {
   ASSERT_WEBVIEW_FAILED(webview_run(w));
   ASSERT_WEBVIEW_FAILED(webview_destroy(w));
 }
+
+TEST_CASE("webview_destroy refuses a handle already destroyed") {
+  REQUIRE(webview_destroy(nullptr) == WEBVIEW_ERROR_INVALID_ARGUMENT);
+  auto w = webview_create(false, nullptr);
+  REQUIRE(w != nullptr);
+  REQUIRE(webview_destroy(w) == WEBVIEW_ERROR_OK);
+  // The handle is gone from the live registry: refused without touching it.
+  REQUIRE(webview_destroy(w) == WEBVIEW_ERROR_INVALID_STATE);
+  REQUIRE(webview_dispatch(w, cb_terminate, nullptr) ==
+          WEBVIEW_ERROR_INVALID_STATE);
+}

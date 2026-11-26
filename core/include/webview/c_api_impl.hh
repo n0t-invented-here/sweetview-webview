@@ -159,16 +159,29 @@ WEBVIEW_API webview_t webview_create(int debug, void *wnd) {
 
 WEBVIEW_API webview_error_t webview_destroy(webview_t w) {
   using namespace webview::detail;
+  if (!w) {
+    return WEBVIEW_ERROR_INVALID_ARGUMENT;
+  }
   return api_filter([=]() -> webview::noresult {
-    auto *instance = cast_to_webview(w);
     {
-      // First: no completion may be queued from here on, and any already
-      // queued does nothing when it runs.
+      // First, and before w is dereferenced: claim the handle by removing it
+      // from the live registry. A handle that is not there (already
+      // destroyed, or never made by webview_create) is refused without
+      // touching it, so a double destroy cannot reach freed memory. From
+      // here on no completion may be queued, and any already queued does
+      // nothing when it runs.
       auto &instances = live_instances();
       std::lock_guard<std::mutex> lock{instances.mutex};
-      instance->mark_destroying();
-      instances.alive.erase(w);
+      auto found = instances.alive.find(w);
+      if (found == instances.alive.end()) {
+        return webview::error_info{WEBVIEW_ERROR_INVALID_STATE,
+                                   "the webview is already destroyed"};
+      }
+      found->second->store(false);
+      instances.alive.erase(found);
     }
+    auto *instance = cast_to_webview(w);
+    instance->mark_destroying();
     delete instance;
     return {};
   });
@@ -191,8 +204,11 @@ WEBVIEW_API webview_error_t webview_dispatch(webview_t w,
   if (!fn) {
     return WEBVIEW_ERROR_INVALID_ARGUMENT;
   }
-  return api_filter(
-      [=] { return cast_to_webview(w)->dispatch([=]() { fn(w, arg); }); });
+  // May come from any thread: the handle is checked against the live
+  // registry, so dispatching to a destroyed webview is refused.
+  return with_live_instance(w, [&](webview::webview *instance) {
+    return instance->dispatch_if_alive([=]() { fn(w, arg); });
+  });
 }
 
 WEBVIEW_API void *webview_get_window(webview_t w) {

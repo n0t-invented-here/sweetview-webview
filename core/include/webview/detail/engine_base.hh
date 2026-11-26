@@ -55,6 +55,8 @@ public:
   engine_base(bool owns_window) : m_owns_window{owns_window} {}
 
   virtual ~engine_base() {
+    // Floor: whatever a backend destructor did, queued work sees a dead engine.
+    mark_destroying();
     std::lock_guard<std::mutex> lock{m_submitted_mutex};
     m_submitted_requests.clear();
   }
@@ -76,12 +78,21 @@ public:
         m_callback(id, args, m_arg);
       }
     }
+    // True until this registration is removed by unbind. A rebind under the
+    // same name gets a new flag, so a call queued for the old registration
+    // never reaches the new one either.
+    const std::shared_ptr<std::atomic<bool>> &active() const {
+      return m_active;
+    }
+    void deactivate() const noexcept { m_active->store(false); }
 
   private:
     // This function is called upon execution of the bound JS function
     binding_t m_callback;
     // This user-supplied argument is passed to the callback
     void *m_arg;
+    std::shared_ptr<std::atomic<bool>> m_active{
+        std::make_shared<std::atomic<bool>>(true)};
   };
 
   using sync_binding_t = std::function<std::string(std::string)>;
@@ -115,6 +126,9 @@ window.__webview__.onBind(" +
     if (found == bindings.end()) {
       return error_info{WEBVIEW_ERROR_NOT_FOUND};
     }
+    // Calls already queued for this registration are skipped when they run:
+    // the caller may free the callback's argument as soon as this returns.
+    found->second.deactivate();
     bindings.erase(found);
     replace_bind_script();
     // Notify that a binding was created if the init script has already
@@ -128,8 +142,10 @@ window.__webview__.onUnbind(" +
 
   noresult resolve(const std::string &id, int status,
                    const std::string &result) {
+    // Queued with the alive token: a reply still queued when the engine is
+    // being destroyed does nothing.
     // NOLINTNEXTLINE(modernize-avoid-bind): Lambda with move requires C++14
-    return dispatch(std::bind(
+    return dispatch_if_alive(std::bind(
         [id, status, this](std::string escaped_result) {
           std::string js = "window.__webview__.onReply(" + json_escape(id) +
                            ", " + std::to_string(status) + ", " +
@@ -485,6 +501,7 @@ protected:
 
   // Queues f on the UI thread; f does nothing if the engine is destroyed
   // before it runs.
+public:
   noresult dispatch_if_alive(std::function<void()> f) {
     auto alive = m_alive;
     return dispatch([alive, f] {
@@ -493,6 +510,8 @@ protected:
       }
     });
   }
+
+protected:
 
   void forget_submitted_request(uint64_t request_id) noexcept {
     std::lock_guard<std::mutex> lock{m_submitted_mutex};
@@ -585,18 +604,28 @@ protected:
     Webview_.prototype.call = function(method) {\n\
       var _id = generateId();\n\
       var _params = Array.prototype.slice.call(arguments, 1);\n\
-      var promise = new Promise(function(resolve, reject) {\n\
-        _promises[_id] = { resolve, reject };\n\
-      });\n\
-      this.post(JSON.stringify({\n\
+      var _message = JSON.stringify({\n\
         id: _id,\n\
         method: method,\n\
         params: _params\n\
-      }));\n\
+      });\n\
+      var promise = new Promise(function(resolve, reject) {\n\
+        _promises[_id] = { resolve: resolve, reject: reject };\n\
+      });\n\
+      try {\n\
+        this.post(_message);\n\
+      } catch (e) {\n\
+        delete _promises[_id];\n\
+        throw e;\n\
+      }\n\
       return promise;\n\
     };\n\
     Webview_.prototype.onReply = function(id, status, result) {\n\
+      if (!Object.prototype.hasOwnProperty.call(_promises, id)) {\n\
+        return;\n\
+      }\n\
       var promise = _promises[id];\n\
+      delete _promises[id];\n\
       if (result !== undefined) {\n\
         try {\n\
           result = JSON.parse(result);\n\
@@ -661,6 +690,12 @@ protected:
     return js;
   }
 
+  // The call is queued, so the binding may be removed (and its argument freed
+  // by the caller) before it runs. Only the registration's active flag is
+  // captured here; when the call runs it looks the binding up again by name
+  // and calls it only if the same registration is still in place. Otherwise
+  // the page's promise is rejected and the old callback is never touched.
+  // The callback runs from a copy, so it may unbind itself.
   virtual void on_message(const std::string &msg) {
     auto id = json_parse(msg, "id", 0);
     auto name = json_parse(msg, "method", 0);
@@ -669,8 +704,26 @@ protected:
     if (found == bindings.end()) {
       return;
     }
-    const auto &context = found->second;
-    dispatch([=] { context.call(id, args); });
+    auto active = found->second.active();
+    dispatch_if_alive([this, id, name, args, active] {
+      auto current = bindings.find(name);
+      if (!active->load() || current == bindings.end() ||
+          current->second.active() != active) {
+        reject_removed_binding(id, name);
+        return;
+      }
+      binding_ctx_t context = current->second;
+      context.call(id, args);
+    });
+  }
+
+  void reject_removed_binding(const std::string &id, const std::string &name) {
+    if (id.empty()) {
+      return;
+    }
+    resolve(id, 1,
+            json_escape("binding \"" + name +
+                        "\" was removed before the call ran"));
   }
 
   virtual void on_window_created() { inc_window_count(); }
@@ -684,12 +737,14 @@ protected:
   }
 
   // Runs the event loop until the currently queued events have been processed.
+  // The flag is heap-owned: if the pump ends early (WM_QUIT), the queued
+  // work may still run later and must not write to a dead stack frame.
   void deplete_run_loop_event_queue() {
-    bool done{};
-    if (!dispatch([&] { done = true; }).ok()) {
+    auto done = std::make_shared<std::atomic<bool>>(false);
+    if (!dispatch([done] { done->store(true); }).ok()) {
       return; // nothing could be queued, so there is nothing to wait for
     }
-    run_event_loop_while([&] { return !done; });
+    run_event_loop_while([done] { return !done->load(); });
   }
 
   // Runs the event loop while the passed-in function returns true.

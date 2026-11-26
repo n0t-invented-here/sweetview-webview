@@ -129,9 +129,9 @@ inline noresult permission_status(unsigned permission) {
 }
 
 /// Asks the system for a permission: it adds the app to the row in System
-/// Settings and shows its dialog each time this is called while the
-/// permission is missing. The user grants it there; an install after that
-/// succeeds.
+/// Settings, and macOS decides whether to show a prompt (it may show none,
+/// for example after the user dismissed one). The user grants it there; an
+/// install after that succeeds.
 inline noresult permission_request(unsigned permission) {
   if (!is_known_permission(permission)) {
     return error_info{WEBVIEW_ERROR_INVALID_ARGUMENT, "Unknown permission"};

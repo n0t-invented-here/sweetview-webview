@@ -1070,3 +1070,125 @@ TEST_CASE("set_file_drop_handler: restores the previous handler on failure") {
   REQUIRE(engine.set_file_drop_handler(nullptr, nullptr).ok());
   REQUIRE(engine.file_drop_handler() == nullptr);
 }
+
+namespace {
+// A windowless engine whose dispatch queue the test drains by hand, so a
+// call can be left queued while the binding behind it changes.
+class queued_engine : public webview::detail::engine_base {
+public:
+  queued_engine() : engine_base{false} {}
+  using engine_base::on_message;
+  std::vector<std::function<void()>> queue;
+  std::vector<std::string> evaluated;
+
+  void run_queue() {
+    while (!queue.empty()) {
+      auto f = std::move(queue.front());
+      queue.erase(queue.begin());
+      f();
+    }
+  }
+
+protected:
+  using noresult = webview::noresult;
+  template <typename T> using result = webview::result<T>;
+  using user_script = webview::detail::user_script;
+
+  noresult navigate_impl(const std::string &) override { return refuse(); }
+  result<void *> window_impl() override { return refuse(); }
+  result<void *> widget_impl() override { return refuse(); }
+  result<void *> browser_controller_impl() override { return refuse(); }
+  noresult run_impl() override { return refuse(); }
+  noresult terminate_impl() override { return refuse(); }
+  noresult dispatch_impl(std::function<void()> f) override {
+    queue.push_back(std::move(f));
+    return {};
+  }
+  noresult set_title_impl(const std::string &) override { return refuse(); }
+  noresult set_size_impl(int, int, webview_hint_t) override {
+    return refuse();
+  }
+  noresult set_html_impl(const std::string &) override { return refuse(); }
+  noresult eval_impl(const std::string &js) override {
+    evaluated.push_back(js);
+    return {};
+  }
+  user_script add_user_script_impl(const std::string &js) override {
+    return user_script{js, user_script::impl_ptr{nullptr,
+                                                 [](user_script::impl *) {}}};
+  }
+  void remove_all_user_scripts_impl(const std::list<user_script> &) override {}
+  bool are_user_scripts_equal_impl(const user_script &,
+                                   const user_script &) override {
+    return false;
+  }
+  void run_event_loop_while(std::function<bool()>) override {}
+
+private:
+  static webview::error_info refuse() {
+    return webview::error_info{WEBVIEW_ERROR_INVALID_STATE};
+  }
+};
+
+int queued_calls_a = 0;
+int queued_calls_b = 0;
+} // namespace
+
+// A call from the page is queued before the binding runs. If unbind (or an
+// unbind and rebind under the same name) happens in between, the queued call
+// must not reach the old callback, whose argument the caller may have freed;
+// the page's promise is rejected instead.
+TEST_CASE("Bindings: a queued call is skipped after unbind") {
+  queued_engine engine;
+  auto count_a = [](const std::string &, const std::string &, void *arg) {
+    ++*static_cast<int *>(arg);
+  };
+  auto count_b = [](const std::string &, const std::string &, void *arg) {
+    ++*static_cast<int *>(arg);
+  };
+  const std::string call =
+      R"({"id":"abc","method":"victim","params":[1]})";
+
+  REQUIRE(engine.bind("victim", count_a, &queued_calls_a).ok());
+  engine.run_queue();
+
+  // Still bound: the queued call runs.
+  engine.on_message(call);
+  engine.run_queue();
+  REQUIRE(queued_calls_a == 1);
+
+  // Unbound before the queued call runs: skipped, and the page is told.
+  engine.on_message(call);
+  REQUIRE(engine.unbind("victim").ok());
+  engine.evaluated.clear();
+  engine.run_queue();
+  REQUIRE(queued_calls_a == 1);
+  bool rejected = false;
+  for (const auto &js : engine.evaluated) {
+    if (js.find("onReply(\"abc\", 1,") != std::string::npos) {
+      rejected = true;
+    }
+  }
+  REQUIRE(rejected);
+
+  // Unbound and bound again: the queued call belonged to the old binding
+  // and reaches neither it nor the new one.
+  REQUIRE(engine.bind("victim", count_a, &queued_calls_a).ok());
+  engine.run_queue();
+  engine.on_message(call);
+  REQUIRE(engine.unbind("victim").ok());
+  REQUIRE(engine.bind("victim", count_b, &queued_calls_b).ok());
+  engine.run_queue();
+  REQUIRE(queued_calls_a == 1);
+  REQUIRE(queued_calls_b == 0);
+
+  // Replies queued when the engine is being destroyed do nothing.
+  engine.on_message(call);
+  engine.run_queue();
+  REQUIRE(queued_calls_b == 1);
+  REQUIRE(engine.resolve("abc", 0, "1").ok());
+  engine.mark_destroying();
+  engine.evaluated.clear();
+  engine.run_queue();
+  REQUIRE(engine.evaluated.empty());
+}

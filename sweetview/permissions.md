@@ -15,13 +15,13 @@ The [mouse hook](mouse-hook.md) and the [keyboard hook](keyboard-hook.md) share 
 filters events, which takes **Device Control and Data Access** in System Settings > Privacy & Security.
 
 ```c
-webview_permission_set_auto_request(0); // no system dialog from a failed install
+webview_permission_set_auto_request(0); // a failed install does not ask the system
 
 unsigned needed = webview_feature_permissions(WEBVIEW_FEATURE_KEYBOARD_HOOK);
 if (needed & WEBVIEW_PERMISSION_DEVICE_CONTROL &&
     webview_permission_status(WEBVIEW_PERMISSION_DEVICE_CONTROL) != WEBVIEW_ERROR_OK) {
   explain_why_the_app_needs_it();
-  webview_permission_request(WEBVIEW_PERMISSION_DEVICE_CONTROL); // the system's dialog
+  webview_permission_request(WEBVIEW_PERMISSION_DEVICE_CONTROL); // asks macOS; it decides whether to prompt
 }
 ```
 
@@ -38,8 +38,8 @@ if (needed & WEBVIEW_PERMISSION_DEVICE_CONTROL &&
 | ---------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `webview_feature_permissions(feature)`         | The `webview_permission_t` bits the feature needs on this platform; 0 when none. Ask this first, then `status` for each bit, and the app knows what it needs before it installs                                                                                                  |
 | `webview_permission_status(permission)`        | `WEBVIEW_ERROR_OK` granted; `WEBVIEW_ERROR_MISSING_DEPENDENCY` not granted; `WEBVIEW_ERROR_UNSPECIFIED` no such permission on this platform (every permission on Windows and Linux); `WEBVIEW_ERROR_INVALID_ARGUMENT` not a `webview_permission_t`. Nothing is shown to the user                                                                                                          |
-| `webview_permission_request(permission)`       | Asks the system. On macOS it adds the app to the row in System Settings and shows the dialog each time this is called while the permission is missing; the user grants it there, and an install after that succeeds. Same answers as `status`; `MISSING_DEPENDENCY` means the dialog was shown |
-| `webview_permission_set_auto_request(on)`      | Whether an install that fails for a missing permission asks the system by itself, once per process, as `request` would. On by default, so an app that never asks about permissions still gets the dialog the first time it installs a hook. Off: the install only fails, and the app asks through `request` |
+| `webview_permission_request(permission)`       | Asks the system. On macOS it adds the app to the row in System Settings; whether a prompt appears is up to macOS (it may show none, for example after the user dismissed one). The user grants the permission in System Settings, and an install after that succeeds. Same answers as `status`; `MISSING_DEPENDENCY` means the permission is still missing after asking |
+| `webview_permission_set_auto_request(on)`      | Whether an install that fails for a missing permission asks the system by itself, once per process, as `request` would. On by default, so an app that never asks about permissions still has the system asked the first time it installs a hook. Off: the install only fails, and the app asks through `request` |
 
 Without the permission, an install fails with `WEBVIEW_ERROR_MISSING_DEPENDENCY` (after asking once,
 if auto-request is on). The caller falls back to whatever else it has, for example hit regions.
