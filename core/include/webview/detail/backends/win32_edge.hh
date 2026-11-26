@@ -1151,18 +1151,23 @@ protected:
     complete_and_erase_pending_request(found);
   }
 
-  // Streamed responses (see webview_begin_response). The stream is made and
-  // registered here, on the caller's thread, so chunks written right after
-  // this returns are kept; the response itself is set on the UI thread.
+  // Streamed responses (see webview_begin_response). The stream's state is
+  // made and registered here, on the caller's thread, so chunks written right
+  // after this returns are kept; the IStream over it is made and handed to
+  // WebView2 on the UI thread, and from then on WebView2's COM references
+  // alone own it. The table holds only the shared state, so ending,
+  // aborting, or forgetting a response never touches the IStream's lifetime.
   noresult begin_response_impl(uint64_t request_id, int status,
                                http_headers_t headers) override {
-    com_ptr<streaming_istream> stream{new streaming_istream{}};
+    auto stream = std::make_shared<stream_state>();
     // When WebView2 lets go of the response early (the page cancelled it),
-    // the stream drops its buffer itself and this queues forgetting it.
-    // Runs inside the stream's Release() under the stream's lock, so it only
+    // the state drops its buffer itself and this queues forgetting it.
+    // Runs inside the IStream's destructor under the state's lock, so it only
     // queues: the UI thread takes m_streams_mutex later. deinit() marks the
     // engine destroyed before it aborts the streams (which waits out a
     // running callback and drops it), so this never reaches a dead engine.
+    // It holds the state by address only, never by reference, so the state
+    // does not keep itself alive.
     {
       auto alive = alive_token();
       auto key = reinterpret_cast<std::uintptr_t>(stream.get());
@@ -1202,7 +1207,7 @@ protected:
   // Any thread: the stream is free-threaded, so no trip to the UI thread.
   noresult write_response_chunk_impl(uint64_t request_id,
                                      std::string chunk) override {
-    com_ptr<streaming_istream> stream;
+    std::shared_ptr<stream_state> stream;
     {
       std::lock_guard<std::mutex> lock{m_streams_mutex};
       auto found = m_active_streams.find(request_id);
@@ -1255,7 +1260,7 @@ protected:
   // 500 and the stream is dropped.
   void start_streamed_response(uint64_t request_id, int status,
                                const http_headers_t &headers,
-                               const com_ptr<streaming_istream> &stream) {
+                               const std::shared_ptr<stream_state> &stream) {
     forget_submitted_request(request_id);
     auto found = m_pending_requests.find(request_id);
     if (found == m_pending_requests.end()) {
@@ -1266,8 +1271,12 @@ protected:
     HRESULT hr = E_FAIL;
     if (build_header_lines(headers, header_lines)) {
       try {
+        // Ours only until CreateWebResourceResponse() takes its own
+        // reference; released when this scope ends, leaving WebView2 as the
+        // only owner. Dropped on failure, which aborts the state.
+        com_ptr<streaming_istream> body{new streaming_istream{stream}};
         hr = try_put_stream_response(found->second.args.get(), status,
-                                     header_lines, stream.get());
+                                     header_lines, body.get());
       } catch (...) {
         hr = E_FAIL;
       }
@@ -1277,8 +1286,6 @@ protected:
       if (!put_fail_closed_response(found->second.args.get())) {
         return; // left deferred; abort_pending_requests() releases it
       }
-    } else {
-      stream->set_handed_off();
     }
     complete_and_erase_pending_request(found);
   }
@@ -1305,7 +1312,7 @@ protected:
 
   // Aborts stream and forgets it, if it is still the one registered.
   void drop_stream(uint64_t request_id,
-                   const com_ptr<streaming_istream> &stream) noexcept {
+                   const std::shared_ptr<stream_state> &stream) noexcept {
     std::lock_guard<std::mutex> lock{m_streams_mutex};
     if (stream) {
       stream->abort();
@@ -1319,7 +1326,7 @@ protected:
 
   // Ends every streamed body still open; a blocked Read() returns E_ABORT.
   void abort_active_streams() noexcept {
-    std::map<uint64_t, com_ptr<streaming_istream>> streams;
+    std::map<uint64_t, std::shared_ptr<stream_state>> streams;
     {
       std::lock_guard<std::mutex> lock{m_streams_mutex};
       streams.swap(m_active_streams);
@@ -1966,7 +1973,7 @@ private:
   // Streamed bodies begun and not yet ended, by request id. Guarded by
   // m_streams_mutex: chunks arrive from any thread.
   std::mutex m_streams_mutex;
-  std::map<uint64_t, com_ptr<streaming_istream>> m_active_streams;
+  std::map<uint64_t, std::shared_ptr<stream_state>> m_active_streams;
   // Whether the drop script (see create_file_drop_script) takes file drops;
   // UI thread only.
   bool m_file_drop_enabled{};

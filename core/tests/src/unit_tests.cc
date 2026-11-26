@@ -504,15 +504,19 @@ TEST_CASE("Mouse and keyboard hooks: either order, either removed first") {
 #endif
 
 #if defined(_WIN32)
+#include <atomic>
 #include <chrono>
+#include <memory>
 #include <thread>
 
 // The body of a streamed response (webview_begin_response): bytes pushed from
 // one thread are read on another as they arrive, the end is S_FALSE after the
 // last byte, and an abort wakes a blocked reader with E_ABORT.
 TEST_CASE("Streaming IStream: push, read, end of stream, abort") {
+  using webview::detail::stream_state;
   using webview::detail::streaming_istream;
-  auto *stream = new streaming_istream{};
+  auto state = std::make_shared<stream_state>();
+  auto *stream = new streaming_istream{state};
 
   // The COM surface: a read-only, forward-only, agile IStream.
   {
@@ -537,24 +541,24 @@ TEST_CASE("Streaming IStream: push, read, end of stream, abort") {
   }
 
   // Bytes already pushed are read at once, in pieces no larger than asked.
-  REQUIRE(stream->push("hello", 5));
+  REQUIRE(state->push("hello", 5));
   char buf[16]{};
   ULONG read = 0;
   REQUIRE(stream->Read(buf, 3, &read) == S_OK);
   REQUIRE(read == 3);
   REQUIRE(std::string(buf, read) == "hel");
-  REQUIRE(stream->Read(buf, sizeof(buf), &read) == S_OK);
+  REQUIRE(stream->Read(buf, 2, &read) == S_OK);
   REQUIRE(std::string(buf, read) == "lo");
-  REQUIRE(stream->buffered() == 0);
+  REQUIRE(state->buffered() == 0);
 
-  // A read with nothing buffered blocks until a chunk arrives.
+  // A read with nothing buffered blocks until the bytes asked for arrive.
   {
-    std::thread writer{[stream] {
+    std::thread writer{[state] {
       std::this_thread::sleep_for(std::chrono::milliseconds(100));
-      stream->push("data: 1\n\n", 9);
+      state->push("data: 1\n\n", 9);
     }};
     auto start = std::chrono::steady_clock::now();
-    REQUIRE(stream->Read(buf, sizeof(buf), &read) == S_OK);
+    REQUIRE(stream->Read(buf, 9, &read) == S_OK);
     auto waited = std::chrono::steady_clock::now() - start;
     writer.join();
     REQUIRE(std::string(buf, read) == "data: 1\n\n");
@@ -563,51 +567,56 @@ TEST_CASE("Streaming IStream: push, read, end of stream, abort") {
 
   // After finish(), what is buffered is still read (a short read at the end
   // is S_FALSE with the bytes), then S_FALSE with 0.
-  REQUIRE(stream->push("tail", 4));
-  stream->finish();
-  REQUIRE(stream->is_closed());
-  REQUIRE_FALSE(stream->push("late", 4));
+  REQUIRE(state->push("tail", 4));
+  state->finish();
+  REQUIRE(state->is_closed());
+  REQUIRE_FALSE(state->push("late", 4));
   REQUIRE(stream->Read(buf, sizeof(buf), &read) == S_FALSE);
   REQUIRE(std::string(buf, read) == "tail");
   REQUIRE(stream->Read(buf, sizeof(buf), &read) == S_FALSE);
   REQUIRE(read == 0);
 
-  // Abandoned only once handed off and every other reference is gone.
-  REQUIRE_FALSE(stream->is_abandoned());
-  stream->set_handed_off();
+  // Abandoned only once the IStream's last reference is gone.
+  REQUIRE_FALSE(state->is_abandoned());
   stream->AddRef();
-  REQUIRE_FALSE(stream->is_abandoned());
   stream->Release();
-  REQUIRE(stream->is_abandoned());
+  REQUIRE_FALSE(state->is_abandoned());
   stream->Release();
+  REQUIRE(state->is_abandoned());
+  REQUIRE(state.use_count() == 1);
 
   // abort() wakes a blocked reader with E_ABORT and drops what is buffered.
-  auto *aborted = new streaming_istream{};
+  auto aborted_state = std::make_shared<stream_state>();
+  auto *aborted = new streaming_istream{aborted_state};
   {
-    std::thread aborter{[aborted] {
+    std::thread aborter{[aborted_state] {
       std::this_thread::sleep_for(std::chrono::milliseconds(100));
-      aborted->abort();
+      aborted_state->abort();
     }};
     REQUIRE(aborted->Read(buf, sizeof(buf), &read) == E_ABORT);
     aborter.join();
     REQUIRE(read == 0);
-    REQUIRE_FALSE(aborted->push("x", 1));
+    REQUIRE_FALSE(aborted_state->push("x", 1));
   }
   aborted->Release();
-  auto *dropped = new streaming_istream{};
-  REQUIRE(dropped->push("kept?", 5));
-  dropped->abort();
-  REQUIRE(dropped->buffered() == 0);
+  auto dropped_state = std::make_shared<stream_state>();
+  auto *dropped = new streaming_istream{dropped_state};
+  REQUIRE(dropped_state->push("kept?", 5));
+  dropped_state->abort();
+  REQUIRE(dropped_state->buffered() == 0);
   REQUIRE(dropped->Read(buf, sizeof(buf), &read) == E_ABORT);
   dropped->Release();
 }
 
 // ISequentialStream::Read contract: a zero-byte read never waits, a NULL
-// buffer for a non-zero read is E_POINTER, a full read is S_OK, and a short
-// read is S_FALSE only once the stream has ended.
+// buffer for a non-zero read is E_POINTER, a read fills all cb bytes (S_OK)
+// across as many pushes as it takes, and a short read is S_FALSE, only at the
+// end of the stream.
 TEST_CASE("Streaming IStream: Read contract") {
+  using webview::detail::stream_state;
   using webview::detail::streaming_istream;
-  auto *stream = new streaming_istream{};
+  auto state = std::make_shared<stream_state>();
+  auto *stream = new streaming_istream{state};
   char buf[8]{};
   ULONG read = 99;
 
@@ -623,82 +632,164 @@ TEST_CASE("Streaming IStream: Read contract") {
   REQUIRE(stream->Read(nullptr, 4, &read) == E_POINTER);
   REQUIRE(read == 0);
 
-  // While open, a short read is S_OK: more may still arrive.
-  REQUIRE(stream->push("abcdef", 6));
-  REQUIRE(stream->Read(buf, 4, &read) == S_OK);
-  REQUIRE(read == 4);
-  REQUIRE(stream->Read(buf, sizeof(buf), &read) == S_OK);
-  REQUIRE(std::string(buf, read) == "ef");
+  // One Read fills all cb bytes from several pushes, waiting for the later
+  // ones, and returns S_OK.
+  {
+    REQUIRE(state->push("ab", 2));
+    std::thread writer{[state] {
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+      state->push("cde", 3);
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+      state->push("fghXY", 5);
+    }};
+    REQUIRE(stream->Read(buf, sizeof(buf), &read) == S_OK);
+    writer.join();
+    REQUIRE(read == sizeof(buf));
+    REQUIRE(std::string(buf, read) == "abcdefgh");
+    REQUIRE(state->buffered() == 2);
+  }
 
-  // After finish(): a read that fills the buffer exactly is S_OK, a short
-  // one is S_FALSE with the bytes, and then S_FALSE with none.
-  REQUIRE(stream->push("1234567890", 10));
-  stream->finish();
-  REQUIRE(stream->Read(buf, sizeof(buf), &read) == S_OK);
-  REQUIRE(std::string(buf, read) == "12345678");
-  REQUIRE(stream->Read(buf, sizeof(buf), &read) == S_FALSE);
-  REQUIRE(std::string(buf, read) == "90");
+  // A read that the end of the stream cuts short is S_FALSE with the bytes,
+  // even when the end arrives while it waits.
+  {
+    std::thread ender{[state] {
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+      state->push("Z", 1);
+      state->finish();
+    }};
+    REQUIRE(stream->Read(buf, sizeof(buf), &read) == S_FALSE);
+    ender.join();
+    REQUIRE(read == 3);
+    REQUIRE(std::string(buf, read) == "XYZ");
+  }
   REQUIRE(stream->Read(buf, sizeof(buf), &read) == S_FALSE);
   REQUIRE(read == 0);
   // A zero-byte read at the end is still S_OK with nothing.
   REQUIRE(stream->Read(buf, 0, &read) == S_OK);
   REQUIRE(read == 0);
   stream->Release();
+
+  // Ended with exactly cb bytes left: S_OK, then S_FALSE with none.
+  auto exact = std::make_shared<stream_state>();
+  auto *exact_stream = new streaming_istream{exact};
+  REQUIRE(exact->push("12345678", 8));
+  exact->finish();
+  REQUIRE(exact_stream->Read(buf, sizeof(buf), &read) == S_OK);
+  REQUIRE(std::string(buf, read) == "12345678");
+  REQUIRE(exact_stream->Read(buf, sizeof(buf), &read) == S_FALSE);
+  REQUIRE(read == 0);
+  exact_stream->Release();
+
+  // An abort while a read is partly filled reports nothing read.
+  auto cut = std::make_shared<stream_state>();
+  auto *cut_stream = new streaming_istream{cut};
+  REQUIRE(cut->push("abc", 3));
+  {
+    std::thread aborter{[cut] {
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+      cut->abort();
+    }};
+    read = 99;
+    REQUIRE(cut_stream->Read(buf, sizeof(buf), &read) == E_ABORT);
+    aborter.join();
+    REQUIRE(read == 0);
+  }
+  cut_stream->Release();
 }
 
-// When WebView2 releases a handed-off stream before it ends, the stream drops
+// When WebView2 releases the IStream before the stream ends, the state drops
 // its buffer at once, refuses further chunks, and calls on_abandoned exactly
-// once; a stream that ended first, or was never handed off, does neither.
+// once; a stream that ended first does neither. The state outlives the
+// IStream for as long as its owner holds it, and vice versa.
 TEST_CASE("Streaming IStream: abandoned stream is reclaimed on release") {
+  using webview::detail::stream_state;
   using webview::detail::streaming_istream;
   int calls = 0;
 
-  auto *stream = new streaming_istream{};
-  stream->set_on_abandoned([&calls] { ++calls; });
-  REQUIRE(stream->push("buffered and never read", 23));
-  stream->set_handed_off();
-  stream->AddRef(); // WebView2's reference
+  auto state = std::make_shared<stream_state>();
+  state->set_on_abandoned([&calls] { ++calls; });
+  auto *stream = new streaming_istream{state}; // WebView2's reference
+  REQUIRE(state->push("buffered and never read", 23));
   stream->AddRef(); // a second one, released first
   stream->Release();
   REQUIRE(calls == 0);
-  REQUIRE(stream->buffered() == 23);
-  stream->Release(); // WebView2 lets go: only the owner's reference is left
+  REQUIRE(state->buffered() == 23);
+  REQUIRE_FALSE(state->is_abandoned());
+  stream->Release(); // WebView2 lets go: only the owner's state is left
   REQUIRE(calls == 1);
-  REQUIRE(stream->buffered() == 0);
-  REQUIRE(stream->is_closed());
-  REQUIRE(stream->is_abandoned());
-  REQUIRE_FALSE(stream->push("late", 4));
+  REQUIRE(state->buffered() == 0);
+  REQUIRE(state->is_closed());
+  REQUIRE(state->is_abandoned());
+  REQUIRE_FALSE(state->push("late", 4));
   char buf[8]{};
   ULONG read = 0;
-  REQUIRE(stream->Read(buf, sizeof(buf), &read) == E_ABORT);
-  // The owner's own short-lived references do not call it again.
-  stream->AddRef();
-  stream->Release();
+  REQUIRE(state->read(buf, sizeof(buf), &read) == E_ABORT);
+  // finish() and abort() afterwards do not call it again.
+  state->finish();
+  state->abort();
   REQUIRE(calls == 1);
-  stream->Release();
 
   // Ended before WebView2 let go: the reader got everything, nothing to do.
-  auto *ended = new streaming_istream{};
+  auto ended = std::make_shared<stream_state>();
   ended->set_on_abandoned([&calls] { ++calls; });
+  auto *ended_stream = new streaming_istream{ended};
   REQUIRE(ended->push("x", 1));
   ended->finish();
-  ended->set_handed_off();
-  ended->AddRef();
-  ended->Release();
+  ended_stream->Release();
   REQUIRE(calls == 1);
   REQUIRE(ended->buffered() == 1);
-  ended->Release();
+  REQUIRE(ended->is_abandoned());
 
-  // Never handed off: the owner's own references coming and going do not
-  // count as WebView2 letting go.
-  auto *kept = new streaming_istream{};
-  kept->set_on_abandoned([&calls] { ++calls; });
-  REQUIRE(kept->push("y", 1));
-  kept->AddRef();
-  kept->Release();
-  REQUIRE(calls == 1);
-  REQUIRE(kept->buffered() == 1);
-  kept->Release();
+  // The owner forgetting the state first leaves the IStream fully usable:
+  // it keeps the state alive until its own last reference goes.
+  std::weak_ptr<stream_state> watch;
+  streaming_istream *orphan = nullptr;
+  {
+    auto owned = std::make_shared<stream_state>();
+    watch = owned;
+    orphan = new streaming_istream{owned};
+    REQUIRE(owned->push("ok", 2));
+    owned->finish();
+  }
+  REQUIRE_FALSE(watch.expired());
+  REQUIRE(orphan->Read(buf, sizeof(buf), &read) == S_FALSE);
+  REQUIRE(std::string(buf, read) == "ok");
+  orphan->Release();
+  REQUIRE(watch.expired());
+}
+
+// The owner ending and forgetting a response (end_response) races WebView2
+// releasing the IStream on its own thread. Neither may touch freed memory,
+// the abandon callback runs at most once (and never after finish() won), and
+// the state is freed exactly when both sides have let go.
+TEST_CASE("Streaming IStream: concurrent finish and consumer release") {
+  using webview::detail::stream_state;
+  using webview::detail::streaming_istream;
+  for (int i = 0; i < 2000; ++i) {
+    std::atomic<int> calls{0};
+    auto owned = std::make_shared<stream_state>();
+    std::weak_ptr<stream_state> watch = owned;
+    owned->set_on_abandoned([&calls] { ++calls; });
+    auto *consumer = new streaming_istream{owned};
+    REQUIRE(owned->push("chunk", 5));
+    std::atomic<bool> go{false};
+    std::thread ender{[&go, &owned] {
+      while (!go.load()) {
+      }
+      owned->finish();
+      owned.reset(); // the table forgets it
+    }};
+    std::thread releaser{[&go, consumer] {
+      while (!go.load()) {
+      }
+      consumer->Release(); // WebView2 lets go
+    }};
+    go.store(true);
+    ender.join();
+    releaser.join();
+    REQUIRE(calls.load() <= 1);
+    REQUIRE(watch.expired());
+  }
 }
 
 // Streaming and file drop entry points refuse bad handles and arguments the
