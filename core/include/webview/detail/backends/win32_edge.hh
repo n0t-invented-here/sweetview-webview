@@ -492,8 +492,8 @@ private:
     // Answers queued by webview_complete_request do nothing from here on.
     mark_destroying();
     if (m_com_handler) {
-      // No more requests reach this engine; answer the ones still open so
-      // their deferrals and event args are released.
+      // No more requests reach this engine; the ones still open are
+      // released by abort_pending_requests() below.
       m_com_handler->set_resource_requested_handler(nullptr);
       // WebView2 may still hold the handler; its creation callbacks capture
       // this engine (and embed()'s locals) and must never run again.
@@ -1077,20 +1077,13 @@ protected:
     complete_and_erase_pending_request(found);
   }
 
-  // Answers every request still open with 503 and releases it. Runs after
-  // the controller is closed: a request that cannot even be given a bare 500
-  // any more has its deferral released without Complete(), so nothing is
-  // passed on to the network.
+  // Releases every request still open without answering it. Runs after the
+  // controller is closed, so WebView2 has already abandoned these requests:
+  // releasing a deferral without Complete() can never pass its request on
+  // to the network.
   void abort_pending_requests() noexcept {
     std::map<uint64_t, pending_request_t> pending_requests;
     pending_requests.swap(m_pending_requests);
-    for (auto &entry : pending_requests) {
-      if (answer_pending_request(entry.second, 503, http_headers_t{},
-                                 std::string{}) &&
-          entry.second.deferral) {
-        entry.second.deferral->Complete();
-      }
-    }
     // The map going out of scope releases every deferral and event args ref.
   }
 

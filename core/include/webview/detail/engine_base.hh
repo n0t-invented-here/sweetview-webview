@@ -232,10 +232,12 @@ window.__webview__.onUnbind(" +
     auto alive = m_alive;
     // Recorded before the answer is queued, so a handler that answers and
     // then throws does not have its answer replaced by the fallback 500.
-    {
+    // Only the call that recorded the id may undo it on failure, so a failed
+    // duplicate completion never erases an earlier successful submission.
+    const bool inserted = [&] {
       std::lock_guard<std::mutex> lock{m_submitted_mutex};
-      m_submitted_requests.insert(request_id);
-    }
+      return m_submitted_requests.insert(request_id).second;
+    }();
     noresult res;
     try {
       res = dispatch([this, alive, request_id, status, headers, bytes] {
@@ -246,10 +248,12 @@ window.__webview__.onUnbind(" +
         complete_request_impl(request_id, status, headers, bytes);
       });
     } catch (...) {
-      forget_submitted_request(request_id);
+      if (inserted) {
+        forget_submitted_request(request_id);
+      }
       throw;
     }
-    if (!res.ok()) {
+    if (!res.ok() && inserted) {
       forget_submitted_request(request_id);
     }
     return res;

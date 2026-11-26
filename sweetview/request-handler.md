@@ -80,10 +80,11 @@ returns.
 
 ## Teardown
 
-What happens to requests still open when the webview is destroyed:
+Requests still open when the webview is destroyed are closed and released without an answer, on
+both platforms; none of them is ever passed on to the network:
 
-- Windows: each is answered `503 Service Unavailable`, then its deferral is completed and the
-  deferral and event args are released.
+- Windows: the WebView2 controller is closed first, then each deferral and its event args are
+  released without `Complete()`.
 - macOS: the retained tasks are released without an answer; WebKit stops them as the `WKWebView`
   goes.
 
