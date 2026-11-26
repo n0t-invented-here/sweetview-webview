@@ -260,7 +260,9 @@ public:
     webview->add_WebMessageReceived(this, &token);
     webview->add_PermissionRequested(this, &token);
 
-    m_cb(controller, webview);
+    if (m_cb) {
+      m_cb(controller, webview);
+    }
     return S_OK;
   }
   HRESULT STDMETHODCALLTYPE
@@ -268,7 +270,7 @@ public:
          ICoreWebView2WebMessageReceivedEventArgs *args) {
     LPWSTR message{};
     auto res = args->TryGetWebMessageAsString(&message);
-    if (SUCCEEDED(res)) {
+    if (SUCCEEDED(res) && m_msgCb) {
       m_msgCb(narrow_string(message));
     }
 
@@ -315,6 +317,15 @@ public:
     m_attempt_handler = attempt_handler;
   }
 
+  // Drops the callbacks that point into the engine. WebView2 can hold this
+  // handler past the engine (a creation still in flight, events queued
+  // before the controller is released); after this they do nothing.
+  void detach() noexcept {
+    m_cb = nullptr;
+    m_attempt_handler = nullptr;
+    m_msgCb = nullptr;
+  }
+
   // Retry creating a WebView2 environment.
   // The initiating logic for creating the environment is defined by the
   // caller of set_attempt_handler().
@@ -323,6 +334,9 @@ public:
     // a running instance using the same user data folder exists, and the
     // Environment objects have different EnvironmentOptions.
     // Source: https://docs.microsoft.com/en-us/microsoft-edge/webview2/reference/win32/icorewebview2environment?view=webview2-1.0.1150.38
+    if (!m_attempt_handler) {
+      return; // detached: the engine is gone
+    }
     if (m_attempts < m_max_attempts) {
       ++m_attempts;
       auto res = m_attempt_handler();
@@ -340,7 +354,9 @@ public:
       return;
     }
     // Give up.
-    m_cb(nullptr, nullptr);
+    if (m_cb) {
+      m_cb(nullptr, nullptr);
+    }
   }
 
 private:
@@ -429,18 +445,39 @@ private:
 class win32_edge_engine : public engine_base {
 public:
   win32_edge_engine(bool debug, void *window) : engine_base{!window} {
-    window_init(window);
-    window_settings(debug);
-    dispatch_size_default();
+    try {
+      window_init(window);
+      window_settings(debug);
+      dispatch_size_default();
+    } catch (...) {
+      // A constructor that throws never reaches the destructor: tear down
+      // whatever was built (windows, wndprocs that hold this, COM refs) so
+      // nothing leaks and nothing calls back into a dead engine.
+      deinit();
+      throw;
+    }
   }
 
-  virtual ~win32_edge_engine() {
+  virtual ~win32_edge_engine() { deinit(); }
+
+  win32_edge_engine(const win32_edge_engine &other) = delete;
+  win32_edge_engine &operator=(const win32_edge_engine &other) = delete;
+  win32_edge_engine(win32_edge_engine &&other) = delete;
+  win32_edge_engine &operator=(win32_edge_engine &&other) = delete;
+
+private:
+  // Releases everything the constructor may have built. Safe on a partially
+  // constructed engine: every step checks what exists first.
+  void deinit() noexcept {
     // Answers queued by webview_complete_request do nothing from here on.
     mark_destroying();
     if (m_com_handler) {
       // No more requests reach this engine; answer the ones still open so
       // their deferrals and event args are released.
       m_com_handler->set_resource_requested_handler(nullptr);
+      // WebView2 may still hold the handler; its creation callbacks capture
+      // this engine (and embed()'s locals) and must never run again.
+      m_com_handler->detach();
     }
     abort_pending_requests();
     if (m_com_handler) {
@@ -474,7 +511,10 @@ public:
     if (m_window) {
       if (owns_window()) {
         DestroyWindow(m_window);
-        on_window_destroyed(true);
+        if (m_window_counted) {
+          m_window_counted = false;
+          on_window_destroyed(true);
+        }
       }
       m_window = nullptr;
     }
@@ -491,11 +531,6 @@ public:
     // Work still queued never runs; it is destroyed here, not leaked.
     close_dispatch_queue();
   }
-
-  win32_edge_engine(const win32_edge_engine &other) = delete;
-  win32_edge_engine &operator=(const win32_edge_engine &other) = delete;
-  win32_edge_engine(win32_edge_engine &&other) = delete;
-  win32_edge_engine &operator=(win32_edge_engine &&other) = delete;
 
 protected:
   noresult run_impl() override {
@@ -747,24 +782,54 @@ protected:
   }
 
   // A bare "500 Internal Server Error" with no body: the answer of last
-  // resort, so a request never goes on to the network.
-  HRESULT put_fail_closed_response(
+  // resort, so a request never goes on to the network. When even that cannot
+  // be built, a 500 with no reason phrase and no headers is tried. Returns
+  // whether a response was actually set on args.
+  //
+  // Failing both means the WebView2 environment itself is unusable, which in
+  // practice only happens while it is being torn down. A request left with no
+  // response is passed through by WebView2, so callers holding a deferral
+  // complete it only when this returns true or the engine is going away (see
+  // complete_deferral).
+  bool put_fail_closed_response(
       ICoreWebView2WebResourceRequestedEventArgs *args) noexcept {
     auto *env = m_com_handler ? m_com_handler->environment() : nullptr;
     if (!env || !args) {
-      return E_POINTER;
+      log_unanswered_request();
+      return false;
     }
     com_ptr<ICoreWebView2WebResourceResponse> response;
     auto hr = env->CreateWebResourceResponse(
         nullptr, 500, L"Internal Server Error", L"Content-Type: text/plain",
         response.put());
-    if (FAILED(hr)) {
-      return hr;
+    if (FAILED(hr) || !response) {
+      response.reset();
+      hr = env->CreateWebResourceResponse(nullptr, 500, L"", L"",
+                                          response.put());
     }
-    if (!response) {
-      return E_FAIL;
+    if (FAILED(hr) || !response ||
+        FAILED(args->put_Response(response.get()))) {
+      log_unanswered_request();
+      return false;
     }
-    return args->put_Response(response.get());
+    return true;
+  }
+
+  static void log_unanswered_request() noexcept {
+    OutputDebugStringW(
+        L"webview: could not set even a bare 500 on a request; the WebView2 "
+        L"environment is unusable (being torn down)\n");
+  }
+
+  // Completes a deferral. When no response could be set the request is left
+  // deferred instead, because completing it would let WebView2 pass it on to
+  // the network unanswered; only while the engine is going away is it
+  // completed regardless, so the deferral and event args are released.
+  void complete_deferral(ICoreWebView2Deferral *deferral,
+                         bool answered) noexcept {
+    if (deferral && (answered || !is_alive())) {
+      deferral->Complete();
+    }
   }
 
   HRESULT try_put_response(ICoreWebView2WebResourceRequestedEventArgs *args,
@@ -801,8 +866,9 @@ protected:
 
   // Sets the response on the event args; an empty body sends no stream. When
   // the response cannot be built (headers WebView2 refuses, no memory for
-  // the body stream) a bare 500 is set instead, never nothing.
-  void put_response(ICoreWebView2WebResourceRequestedEventArgs *args,
+  // the body stream) a bare 500 is set instead, never nothing. Returns
+  // whether any response was set.
+  bool put_response(ICoreWebView2WebResourceRequestedEventArgs *args,
                     int status, const std::wstring &headers,
                     const std::string &body) noexcept {
     HRESULT hr = E_FAIL;
@@ -811,9 +877,10 @@ protected:
     } catch (...) {
       hr = E_FAIL;
     }
-    if (FAILED(hr)) {
-      put_fail_closed_response(args);
+    if (SUCCEEDED(hr)) {
+      return true;
     }
+    return put_fail_closed_response(args);
   }
 
   void on_web_resource_requested(
@@ -900,14 +967,32 @@ protected:
               com_ptr<ICoreWebView2WebResourceRequestedEventArgs>::add_ref(
                   args)});
     } catch (...) {
-      put_fail_closed_response(args);
-      deferral->Complete();
+      complete_deferral(deferral.get(), put_fail_closed_response(args));
       return;
     }
 
-    handler(request_id, method.c_str(), url.c_str(), headers_json.c_str(),
-            body.empty() ? nullptr : body.data(), body.size(),
-            request_handler_arg());
+    try {
+      handler(request_id, method.c_str(), url.c_str(), headers_json.c_str(),
+              body.empty() ? nullptr : body.data(), body.size(),
+              request_handler_arg());
+    } catch (...) {
+      // A handler that throws must not strand the request: if it did not
+      // answer before throwing, answer it here with the fallback 500. The
+      // exception goes no further (WebView2 cannot take it).
+      fail_pending_request(request_id);
+    }
+  }
+
+  // Answers a still-open request with the fallback 500 and completes it.
+  void fail_pending_request(uint64_t request_id) noexcept {
+    auto found = m_pending_requests.find(request_id);
+    if (found == m_pending_requests.end()) {
+      return; // already answered
+    }
+    auto pending = std::move(found->second);
+    m_pending_requests.erase(found);
+    complete_deferral(pending.deferral.get(),
+                      put_fail_closed_response(pending.args.get()));
   }
 
   // Answers the deferred request and completes its deferral, whatever
@@ -930,12 +1015,10 @@ protected:
     } catch (...) {
       built = false;
     }
-    if (built) {
-      put_response(pending.args.get(), status, header_lines, body);
-    } else {
-      put_fail_closed_response(pending.args.get());
-    }
-    pending.deferral->Complete();
+    bool answered = built ? put_response(pending.args.get(), status,
+                                         header_lines, body)
+                          : put_fail_closed_response(pending.args.get());
+    complete_deferral(pending.deferral.get(), answered);
   }
 
   void complete_request_impl(uint64_t request_id, int status,
@@ -1159,6 +1242,7 @@ private:
         throw exception{WEBVIEW_ERROR_INVALID_STATE, "Window is null"};
       }
       on_window_created();
+      m_window_counted = true;
 
       m_dpi = get_window_dpi(m_window);
     } else {
@@ -1453,6 +1537,9 @@ private:
   std::deque<dispatch_fn_t> m_dispatch_queue;
   // -1 until webview_set_allow_external_drop, then 0 or 1.
   int m_allow_external_drop = -1;
+  // True once on_window_created() counted the owned window, so teardown
+  // uncounts it exactly once (and never for a window that was never made).
+  bool m_window_counted = false;
 };
 
 } // namespace detail

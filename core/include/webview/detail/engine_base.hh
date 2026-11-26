@@ -286,8 +286,15 @@ protected:
   }
   void *request_handler_arg() const { return m_request_handler_arg; }
 
-  // Request ids handed to the request handler: never 0, never reused.
-  uint64_t next_request_id() { return ++m_last_request_id; }
+  // Request ids handed to the request handler: never 0 and never reused
+  // across the whole process. A process-wide counter (rather than one per
+  // instance) guarantees that a late webview_complete_request() carrying an
+  // id from a destroyed webview can never match a request of a newer webview
+  // that happens to reuse the same heap address.
+  static uint64_t next_request_id() {
+    static std::atomic<uint64_t> counter{1};
+    return counter.fetch_add(1, std::memory_order_relaxed);
+  }
 
   virtual user_script *add_user_script(const std::string &js) {
     return std::addressof(*m_user_scripts.emplace(m_user_scripts.end(),
@@ -493,7 +500,6 @@ private:
   std::map<std::string, asset_t> m_assets;
   webview_request_handler_t m_request_handler{};
   void *m_request_handler_arg{};
-  uint64_t m_last_request_id{};
   // False once the engine is being destroyed; see mark_destroying.
   std::shared_ptr<std::atomic<bool>> m_alive{
       std::make_shared<std::atomic<bool>>(true)};
