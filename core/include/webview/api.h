@@ -296,6 +296,83 @@ WEBVIEW_API webview_error_t webview_complete_request(webview_t w,
                                                      size_t body_len);
 
 /**
+ * Starts a streamed answer to a request handed to the request handler (see
+ * webview_set_request_handler): sends the status and headers now, then the
+ * body arrives piece by piece through webview_write_response_chunk and ends
+ * with webview_end_response. Where the engine delivers partial bodies
+ * (macOS), Server-Sent Events (text/event-stream) and large media reach the
+ * page as they are produced; on Windows the page sees the body only once it
+ * has ended (see Remarks). Use instead of webview_complete_request, never
+ * both for one request.
+ *
+ * Safe to call from any thread, under the same rules as
+ * webview_complete_request: @p status and @p headers_json are checked before
+ * this returns, and once webview_destroy has begun this returns
+ * WEBVIEW_ERROR_INVALID_STATE. Starting a request that was already answered
+ * or cancelled does nothing; the chunks written for it are dropped.
+ *
+ * Remarks:
+ * - Windows: the response's content is an IStream whose Read() blocks on
+ *   WebView2's background thread until a chunk or the end arrives, so the
+ *   UI thread never waits and only unread bytes are held. Chunks may be
+ *   written before the response reaches WebView2. WebView2 itself reads the
+ *   whole stream before it hands the response to the page (a documented
+ *   WebView2 limitation: a WebResourceRequested response is never delivered
+ *   in parts), so the page receives the body at webview_end_response, not
+ *   chunk by chunk. Destroying the webview aborts every stream still open.
+ * - macOS: WKURLSchemeTask didReceiveResponse:, then didReceiveData: per
+ *   chunk and didFinish, each on the main queue. A task WebKit stops is
+ *   forgotten, and later chunks and the end do nothing.
+ * - Linux: accepted; does nothing.
+ *
+ * @param w The webview instance.
+ * @param request_id The @c request_id the handler received.
+ * @param status HTTP status code, 100-599.
+ * @param headers_json Response headers, exactly as for
+ *                     webview_complete_request. NULL or "" for none.
+ * @return WEBVIEW_ERROR_INVALID_STATE when @p w is destroyed or being
+ *         destroyed; WEBVIEW_ERROR_INVALID_ARGUMENT for a bad argument or bad
+ *         headers.
+ */
+WEBVIEW_API webview_error_t webview_begin_response(webview_t w,
+                                                   uint64_t request_id,
+                                                   int status,
+                                                   const char *headers_json);
+
+/**
+ * Appends a piece of the body to a response started with
+ * webview_begin_response. Safe to call from any thread; the bytes are copied
+ * before this returns. A chunk for a response that has ended, was never
+ * started, or that the page abandoned is dropped. @p chunk_len 0 does
+ * nothing.
+ *
+ * @param w The webview instance.
+ * @param request_id The @c request_id passed to webview_begin_response.
+ * @param chunk The bytes, or NULL when @p chunk_len is 0.
+ * @param chunk_len Length of @p chunk in bytes, at most 4294967295
+ *                  (UINT32_MAX).
+ * @return WEBVIEW_ERROR_INVALID_STATE when @p w is destroyed or being
+ *         destroyed; WEBVIEW_ERROR_INVALID_ARGUMENT for a bad argument.
+ */
+WEBVIEW_API webview_error_t webview_write_response_chunk(webview_t w,
+                                                         uint64_t request_id,
+                                                         const void *chunk,
+                                                         size_t chunk_len);
+
+/**
+ * Ends a response started with webview_begin_response: the page sees the end
+ * of the body once it has read every chunk written before. Safe to call from
+ * any thread. Ending a response twice, or one never started, does nothing.
+ *
+ * @param w The webview instance.
+ * @param request_id The @c request_id passed to webview_begin_response.
+ * @return WEBVIEW_ERROR_INVALID_STATE when @p w is destroyed or being
+ *         destroyed; WEBVIEW_ERROR_INVALID_ARGUMENT for a bad argument.
+ */
+WEBVIEW_API webview_error_t webview_end_response(webview_t w,
+                                                 uint64_t request_id);
+
+/**
  * Sets whether files and other content dragged from outside the app can be
  * dropped on the page. Allowed by default.
  *
@@ -308,6 +385,30 @@ WEBVIEW_API webview_error_t webview_complete_request(webview_t w,
  */
 WEBVIEW_API webview_error_t webview_set_allow_external_drop(webview_t w,
                                                             int allow);
+
+/**
+ * Sets the function that receives the real filesystem paths of files dropped
+ * on the webview from the operating system (Explorer, Finder). While a
+ * handler is set, a drop of files is taken by the webview instead of the page,
+ * and the browser does not navigate to the dropped file. Drags inside the
+ * page, and drags that carry no files, are not affected. Passing @p fn NULL
+ * removes the handler and restores the page's own handling. Call from the UI
+ * thread.
+ *
+ * Remarks:
+ * - Windows: the top-level document's drop event hands the dropped File
+ *   objects to the host with chrome.webview.postMessageWithAdditionalObjects,
+ *   which gives their paths (ICoreWebView2File). Needs external drop allowed
+ *   (see webview_set_allow_external_drop) and WebView2 Runtime 113 or later.
+ * - macOS: the WKWebView takes the drag when its pasteboard holds file URLs.
+ * - Linux: accepted; does nothing.
+ *
+ * @param w The webview instance.
+ * @param fn The handler, or NULL to remove it.
+ * @param arg Passed to @p fn as is.
+ */
+WEBVIEW_API webview_error_t webview_set_file_drop_handler(
+    webview_t w, webview_file_drop_handler_t fn, void *arg);
 
 /**
  * Installs a system-wide mouse hook: @p fn sees every mouse event on the

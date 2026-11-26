@@ -109,6 +109,27 @@ inline live_instances_t &live_instances() {
   return *instances;
 }
 
+// Runs fn on the instance behind w while holding the live-instance lock, so
+// webview_destroy cannot free it in the middle; a handle destroyed or being
+// destroyed gets WEBVIEW_ERROR_INVALID_STATE. For the calls that may come
+// from any thread.
+template <typename Fn>
+webview_error_t with_live_instance(webview_t w, Fn &&fn) noexcept {
+  if (!w) {
+    return WEBVIEW_ERROR_INVALID_ARGUMENT;
+  }
+  return api_filter([&]() -> noresult {
+    auto &instances = live_instances();
+    std::lock_guard<std::mutex> lock{instances.mutex};
+    auto found = instances.alive.find(w);
+    if (found == instances.alive.end() || !found->second->load()) {
+      return error_info{WEBVIEW_ERROR_INVALID_STATE,
+                        "the webview is destroyed or being destroyed"};
+    }
+    return fn(cast_to_webview(w));
+  });
+}
+
 } // namespace detail
 } // namespace webview
 
@@ -260,22 +281,46 @@ WEBVIEW_API webview_error_t webview_complete_request(webview_t w,
                                                      const void *body,
                                                      size_t body_len) {
   using namespace webview::detail;
-  if (!w) {
-    return WEBVIEW_ERROR_INVALID_ARGUMENT;
-  }
-  return api_filter([=]() -> webview::noresult {
-    // Held while the answer is validated, copied and queued, so
-    // webview_destroy cannot free the instance in the middle of it.
-    auto &instances = live_instances();
-    std::lock_guard<std::mutex> lock{instances.mutex};
-    auto found = instances.alive.find(w);
-    if (found == instances.alive.end() || !found->second->load()) {
-      return webview::error_info{WEBVIEW_ERROR_INVALID_STATE,
-                                 "the webview is destroyed or being destroyed"};
-    }
-    return cast_to_webview(w)->complete_request(request_id, status,
-                                                headers_json, body, body_len);
+  // The lock is held while the answer is validated, copied and queued.
+  return with_live_instance(w, [&](webview::webview *instance) {
+    return instance->complete_request(request_id, status, headers_json, body,
+                                      body_len);
   });
+}
+
+WEBVIEW_API webview_error_t webview_begin_response(webview_t w,
+                                                   uint64_t request_id,
+                                                   int status,
+                                                   const char *headers_json) {
+  using namespace webview::detail;
+  return with_live_instance(w, [&](webview::webview *instance) {
+    return instance->begin_response(request_id, status, headers_json);
+  });
+}
+
+WEBVIEW_API webview_error_t webview_write_response_chunk(webview_t w,
+                                                         uint64_t request_id,
+                                                         const void *chunk,
+                                                         size_t chunk_len) {
+  using namespace webview::detail;
+  return with_live_instance(w, [&](webview::webview *instance) {
+    return instance->write_response_chunk(request_id, chunk, chunk_len);
+  });
+}
+
+WEBVIEW_API webview_error_t webview_end_response(webview_t w,
+                                                 uint64_t request_id) {
+  using namespace webview::detail;
+  return with_live_instance(w, [&](webview::webview *instance) {
+    return instance->end_response(request_id);
+  });
+}
+
+WEBVIEW_API webview_error_t webview_set_file_drop_handler(
+    webview_t w, webview_file_drop_handler_t fn, void *arg) {
+  using namespace webview::detail;
+  return api_filter(
+      [=] { return cast_to_webview(w)->set_file_drop_handler(fn, arg); });
 }
 
 WEBVIEW_API webview_error_t webview_set_allow_external_drop(webview_t w,

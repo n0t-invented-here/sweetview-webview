@@ -191,7 +191,9 @@ typedef int (*webview_keyboard_hook_fn_t)(int event, const char *code,
  * Called for a request the webview's own origins could not answer from the
  * asset table (see webview_set_request_handler). Runs on the UI thread, from
  * inside the run loop. Answer it later, from any thread, with
- * webview_complete_request and the same @p request_id.
+ * webview_complete_request and the same @p request_id, or stream the answer
+ * with webview_begin_response, webview_write_response_chunk and
+ * webview_end_response.
  *
  * Every pointer argument is valid only for the duration of the call; copy
  * what is needed afterwards.
@@ -211,5 +213,16 @@ typedef void (*webview_request_handler_t)(uint64_t request_id,
                                           const char *headers_json,
                                           const void *body, size_t body_len,
                                           void *arg);
+
+/**
+ * Called when files from the operating system are dropped on the webview (see
+ * webview_set_file_drop_handler). Runs on the UI thread.
+ *
+ * @param paths_json The dropped files' full filesystem paths, as a JSON array
+ *                   of UTF-8 strings, for example ["C:\a.txt","C:\b.png"].
+ *                   Valid only for the duration of the call.
+ * @param arg The @p arg passed to webview_set_file_drop_handler.
+ */
+typedef void (*webview_file_drop_handler_t)(const char *paths_json, void *arg);
 
 #endif // WEBVIEW_TYPES_H

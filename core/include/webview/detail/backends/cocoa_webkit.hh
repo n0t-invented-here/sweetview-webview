@@ -58,6 +58,7 @@
 #include <list>
 #include <map>
 #include <memory>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -124,6 +125,11 @@ public:
       objc::release(entry.second);
     }
     m_pending_tasks.clear();
+    m_streaming_tasks.clear();
+    if (m_webview) {
+      // Drags still reaching the WKWebView must not reach this engine.
+      set_associated_webview(m_webview, nullptr);
+    }
     if (m_window) {
       if (m_webview) {
         if (auto ui_delegate{WKWebView_get_UIDelegate(m_webview)}) {
@@ -389,6 +395,15 @@ private:
                                          const http_headers_t &headers,
                                          const char *body, size_t body_len) {
     objc::autoreleasepool arp;
+    send_url_scheme_response_head(task, url, status, headers);
+    send_url_scheme_response_data(task, body, body_len);
+    objc::msg_send<void>(task, objc::selector("didFinish"));
+  }
+
+  // Sends a task its status and headers (didReceiveResponse:).
+  static void send_url_scheme_response_head(id task, id url, int status,
+                                            const http_headers_t &headers) {
+    objc::autoreleasepool arp;
     // An HTTP-style response, so WebKit reads the Content-Type (parameters
     // and all, "text/html; charset=utf-8") the way it would from a server. A
     // plain NSURLResponse takes a bare MIME type; given one with parameters
@@ -438,13 +453,19 @@ private:
         url, static_cast<NSInteger>(status),
         NSString_stringWithUTF8String("HTTP/1.1"), dict));
     objc::msg_send<void>(task, objc::selector("didReceiveResponse:"), response);
-    if (body && body_len > 0) {
-      auto data = objc::msg_send<id>(
-          objc::get_class("NSData"), objc::selector("dataWithBytes:length:"),
-          static_cast<const void *>(body), static_cast<NSUInteger>(body_len));
-      objc::msg_send<void>(task, objc::selector("didReceiveData:"), data);
+  }
+
+  // Sends a task part of its body (didReceiveData:); nothing when empty.
+  static void send_url_scheme_response_data(id task, const char *body,
+                                            size_t body_len) {
+    if (!body || body_len == 0) {
+      return;
     }
-    objc::msg_send<void>(task, objc::selector("didFinish"));
+    objc::autoreleasepool arp;
+    auto data = objc::msg_send<id>(
+        objc::get_class("NSData"), objc::selector("dataWithBytes:length:"),
+        static_cast<const void *>(body), static_cast<NSUInteger>(body_len));
+    objc::msg_send<void>(task, objc::selector("didReceiveData:"), data);
   }
 
   static std::string nsstring_to_string(id s) {
@@ -590,6 +611,7 @@ private:
     for (auto it = m_pending_tasks.begin(); it != m_pending_tasks.end(); ++it) {
       if (it->second == task) {
         auto stopped = it->second;
+        m_streaming_tasks.erase(it->first);
         m_pending_tasks.erase(it);
         objc::release(stopped);
         return;
@@ -604,6 +626,10 @@ private:
     if (found == m_pending_tasks.end()) {
       return; // already answered, or stopped by WebKit
     }
+    // NOLINTNEXTLINE(readability-container-contains): contains() requires C++20
+    if (m_streaming_tasks.count(request_id) > 0) {
+      return; // a streamed answer has begun; only webview_end_response ends it
+    }
     auto task = found->second;
     m_pending_tasks.erase(found);
     {
@@ -614,6 +640,186 @@ private:
                                  body.size());
     }
     objc::release(task);
+  }
+
+  // Streamed responses (see webview_begin_response). Every step runs on the
+  // main queue, in the order it was called; a task WebKit stopped in between
+  // is gone from m_pending_tasks, so what follows for it does nothing.
+  noresult begin_response_impl(uint64_t request_id, int status,
+                               http_headers_t headers) override {
+    return dispatch_if_alive([this, request_id, status, headers] {
+      forget_submitted_request(request_id);
+      auto found = m_pending_tasks.find(request_id);
+      // NOLINTNEXTLINE(readability-container-contains): contains() requires C++20
+      if (found == m_pending_tasks.end() ||
+          m_streaming_tasks.count(request_id) > 0) {
+        return; // answered, stopped, or already begun
+      }
+      auto task = found->second;
+      objc::autoreleasepool arp;
+      auto request = objc::msg_send<id>(task, objc::selector("request"));
+      auto url = objc::msg_send<id>(request, objc::selector("URL"));
+      send_url_scheme_response_head(task, url, status, headers);
+      m_streaming_tasks.insert(request_id);
+    });
+  }
+
+  noresult write_response_chunk_impl(uint64_t request_id,
+                                     std::string chunk) override {
+    return dispatch_if_alive([this, request_id, chunk] {
+      auto found = m_pending_tasks.find(request_id);
+      // NOLINTNEXTLINE(readability-container-contains): contains() requires C++20
+      if (found == m_pending_tasks.end() ||
+          m_streaming_tasks.count(request_id) == 0) {
+        return;
+      }
+      send_url_scheme_response_data(found->second, chunk.data(), chunk.size());
+    });
+  }
+
+  noresult end_response_impl(uint64_t request_id) override {
+    return dispatch_if_alive([this, request_id] {
+      auto found = m_pending_tasks.find(request_id);
+      if (found == m_pending_tasks.end()) {
+        return; // already ended, or stopped by WebKit
+      }
+      // NOLINTNEXTLINE(readability-container-contains): contains() requires C++20
+      if (m_streaming_tasks.count(request_id) == 0) {
+        return; // never begun: webview_complete_request may still answer it
+      }
+      auto task = found->second;
+      m_pending_tasks.erase(found);
+      m_streaming_tasks.erase(request_id);
+      {
+        objc::autoreleasepool arp;
+        objc::msg_send<void>(task, objc::selector("didFinish"));
+      }
+      objc::release(task);
+    });
+  }
+
+  // File drops (see webview_set_file_drop_handler): the WKWebView subclass
+  // asks file_drop_handler() on every drag, so there is nothing to switch.
+  noresult set_file_drop_handler_impl(bool /*enabled*/) override { return {}; }
+
+  // A WKWebView that takes drags of files from Finder while a file drop
+  // handler is set, and leaves every other drag to WKWebView.
+  static Class get_webview_class() {
+    constexpr auto class_name = "SweetviewWKWebView";
+    // Avoid crash due to registering same class twice
+    auto cls = objc_lookUpClass(class_name);
+    if (cls) {
+      return cls;
+    }
+    cls = objc_allocateClassPair(objc::get_class("WKWebView"), class_name, 0);
+    class_addMethod(cls, objc::selector("draggingEntered:"),
+                    (IMP)(+[](id self, SEL sel, id sender) -> NSUInteger {
+                      if (takes_file_drag(self, sender)) {
+                        return 1; // NSDragOperationCopy
+                      }
+                      return call_webview_super<NSUInteger>(self, sel, sender);
+                    }),
+                    "Q@:@");
+    class_addMethod(cls, objc::selector("draggingUpdated:"),
+                    (IMP)(+[](id self, SEL sel, id sender) -> NSUInteger {
+                      if (takes_file_drag(self, sender)) {
+                        return 1; // NSDragOperationCopy
+                      }
+                      return call_webview_super<NSUInteger>(self, sel, sender);
+                    }),
+                    "Q@:@");
+    class_addMethod(cls, objc::selector("prepareForDragOperation:"),
+                    (IMP)(+[](id self, SEL sel, id sender) -> BOOL {
+                      if (takes_file_drag(self, sender)) {
+                        return YES;
+                      }
+                      return call_webview_super<BOOL>(self, sel, sender);
+                    }),
+                    "c@:@");
+    class_addMethod(cls, objc::selector("performDragOperation:"),
+                    (IMP)(+[](id self, SEL sel, id sender) -> BOOL {
+                      if (takes_file_drag(self, sender)) {
+                        if (auto w = get_associated_webview(self)) {
+                          w->deliver_file_drop(dragged_file_paths(sender));
+                        }
+                        return YES;
+                      }
+                      return call_webview_super<BOOL>(self, sel, sender);
+                    }),
+                    "c@:@");
+    objc_registerClassPair(cls);
+    return cls;
+  }
+
+  // Calls WKWebView's own implementation of a drag method.
+  template <typename Result>
+  static Result call_webview_super(id self, SEL sel, id sender) {
+    struct objc_super super_info {
+      self, objc::get_class("WKWebView")
+    };
+    return objc::invoke<Result>(objc_msgSendSuper, &super_info, sel, sender);
+  }
+
+  static id file_url_type() {
+    return NSString_stringWithUTF8String("public.file-url");
+  }
+
+  // True when the engine behind the WKWebView has a file drop handler and
+  // the drag carries file URLs.
+  static bool takes_file_drag(id self, id sender) {
+    auto w = get_associated_webview(self);
+    if (!w || !w->file_drop_handler() || !sender) {
+      return false;
+    }
+    objc::autoreleasepool arp;
+    auto pasteboard =
+        objc::msg_send<id>(sender, objc::selector("draggingPasteboard"));
+    if (!pasteboard) {
+      return false;
+    }
+    auto types = objc::msg_send<id>(pasteboard, objc::selector("types"));
+    return types && objc::msg_send<BOOL>(types,
+                                         objc::selector("containsObject:"),
+                                         file_url_type());
+  }
+
+  // The filesystem path of every file URL on the drag's pasteboard.
+  static std::vector<std::string> dragged_file_paths(id sender) {
+    std::vector<std::string> paths;
+    objc::autoreleasepool arp;
+    auto pasteboard =
+        objc::msg_send<id>(sender, objc::selector("draggingPasteboard"));
+    if (!pasteboard) {
+      return paths;
+    }
+    auto items =
+        objc::msg_send<id>(pasteboard, objc::selector("pasteboardItems"));
+    if (!items) {
+      return paths;
+    }
+    auto count = objc::msg_send<NSUInteger>(items, objc::selector("count"));
+    for (NSUInteger i = 0; i < count; ++i) {
+      auto item =
+          objc::msg_send<id>(items, objc::selector("objectAtIndex:"), i);
+      auto string = objc::msg_send<id>(item, objc::selector("stringForType:"),
+                                       file_url_type());
+      if (!string) {
+        continue;
+      }
+      // A file reference URL (file:///.file/id=...) becomes a path URL.
+      auto url = objc::msg_send<id>(objc::get_class("NSURL"),
+                                    objc::selector("URLWithString:"), string);
+      auto file_url =
+          url ? objc::msg_send<id>(url, objc::selector("filePathURL"))
+              : nullptr;
+      auto path = nsstring_to_string(
+          file_url ? objc::msg_send<id>(file_url, objc::selector("path"))
+                   : nullptr);
+      if (!path.empty()) {
+        paths.push_back(path);
+      }
+    }
+    return paths;
   }
 
   id create_script_message_handler() {
@@ -814,8 +1020,12 @@ private:
 #endif
 
     auto ui_delegate = create_webkit_ui_delegate();
-    m_webview =
-        objc::retain(WKWebView_withFrame(CGRectMake(0, 0, 0, 0), config));
+    // A WKWebView subclass, so files dropped from Finder can be taken
+    // before the page sees them (see webview_set_file_drop_handler).
+    m_webview = objc::retain(objc::autorelease(WKWebView_initWithFrame(
+        objc::msg_send<id>(get_webview_class(), objc::selector("alloc")),
+        CGRectMake(0, 0, 0, 0), config)));
+    set_associated_webview(m_webview, this);
     // Autoresizing mask is needed to prevent the Web Inspector pane from
     // pushing the main web view out of bounds
     auto autoresizing_mask{static_cast<NSAutoresizingMaskOptions>(
@@ -948,6 +1158,9 @@ private:
   // Tasks handed to the request handler and not yet answered or stopped;
   // each is retained.
   std::map<uint64_t, id> m_pending_tasks;
+  // Of those, the ones whose streamed answer has sent its head
+  // (webview_begin_response) and not yet finished.
+  std::set<uint64_t> m_streaming_tasks;
 };
 
 } // namespace cocoa_webkit

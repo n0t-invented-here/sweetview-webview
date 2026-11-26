@@ -50,6 +50,7 @@
 #include "../platform/windows/dpi.hh"
 #include "../platform/windows/iid.hh"
 #include "../platform/windows/reg_key.hh"
+#include "../platform/windows/streaming_istream.hh"
 #include "../platform/windows/theme.hh"
 #include "../platform/windows/version.hh"
 #include "../platform/windows/webview2/loader.hh"
@@ -69,6 +70,7 @@
 #include <mutex>
 #include <string>
 #include <utility>
+#include <vector>
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -174,6 +176,8 @@ class webview2_com_handler
       std::function<void(ICoreWebView2Controller *, ICoreWebView2 *webview)>;
   using resource_requested_cb_t =
       std::function<void(ICoreWebView2WebResourceRequestedEventArgs *)>;
+  using file_drop_message_cb_t =
+      std::function<void(ICoreWebView2WebMessageReceivedEventArgs *)>;
 
 public:
   webview2_com_handler(HWND hwnd, msg_cb_t msgCb, webview2_com_handler_cb_t cb)
@@ -282,14 +286,36 @@ public:
     // ICoreWebView2Frame2::WebMessageReceived, which is never subscribed.
     // So iframes cannot reach bindings through this path (the live iframe
     // test in sweetview-webview-bun checks it).
-    LPWSTR message{};
-    auto res = args->TryGetWebMessageAsString(&message);
-    if (SUCCEEDED(res) && m_msgCb) {
-      m_msgCb(narrow_string(message));
+    if (!args) {
+      return S_OK;
     }
-
-    CoTaskMemFree(message);
+    cotaskmem_wstr message;
+    auto res = args->TryGetWebMessageAsString(message.put());
+    if (FAILED(res) || !message.get()) {
+      return S_OK;
+    }
+    // Posted by the file drop script with the dropped File objects attached;
+    // never a binding call, so it never reaches m_msgCb.
+    if (lstrcmpW(message.get(), file_drop_message()) == 0) {
+      if (m_file_drop_cb) {
+        try {
+          m_file_drop_cb(args);
+        } catch (...) {
+          // Nothing may unwind into WebView2.
+        }
+      }
+      return S_OK;
+    }
+    if (m_msgCb) {
+      m_msgCb(message.narrow());
+    }
     return S_OK;
+  }
+
+  // The web message the file drop script posts (see
+  // webview_set_file_drop_handler).
+  static const wchar_t *file_drop_message() noexcept {
+    return L"__sweetview_file_drop__";
   }
   HRESULT STDMETHODCALLTYPE
   Invoke(ICoreWebView2 * /*sender*/,
@@ -320,6 +346,11 @@ public:
     m_resource_requested_cb = std::move(cb);
   }
 
+  // Called for the web message the file drop script posts.
+  void set_file_drop_message_handler(file_drop_message_cb_t cb) noexcept {
+    m_file_drop_cb = std::move(cb);
+  }
+
   // The environment the controller was created from; null until then.
   ICoreWebView2Environment *environment() const noexcept {
     return m_environment;
@@ -338,6 +369,7 @@ public:
     m_cb = nullptr;
     m_attempt_handler = nullptr;
     m_msgCb = nullptr;
+    m_file_drop_cb = nullptr;
   }
 
   // Retry creating a WebView2 environment.
@@ -389,6 +421,7 @@ private:
   msg_cb_t m_msgCb;
   webview2_com_handler_cb_t m_cb;
   resource_requested_cb_t m_resource_requested_cb;
+  file_drop_message_cb_t m_file_drop_cb;
   ICoreWebView2Environment *m_environment = nullptr;
   std::atomic<ULONG> m_ref_count{1};
   std::function<HRESULT()> m_attempt_handler;
@@ -504,6 +537,10 @@ private:
       // this engine (and embed()'s locals) and must never run again.
       m_com_handler->detach();
     }
+    // Every streamed body still open ends now, before the controller closes:
+    // WebView2's IO thread may be blocked in streaming_istream::Read(), and
+    // it must not stay blocked while WebView2 shuts down.
+    abort_active_streams();
     // Close the controller first so WebView2 tears down its navigation and
     // network stack before any deferral still open is released: a deferral
     // released unanswered can then never send its request to the network.
@@ -1048,8 +1085,16 @@ protected:
   bool answer_pending_request(pending_request_t &pending, int status,
                               const http_headers_t &headers,
                               const std::string &body) noexcept {
-    bool built = false;
     std::wstring header_lines;
+    return build_header_lines(headers, header_lines)
+               ? put_response(pending.args.get(), status, header_lines, body)
+               : put_fail_closed_response(pending.args.get());
+  }
+
+  // "Name: value\r\n" per header, as CreateWebResourceResponse takes them.
+  // False when the headers cannot be converted.
+  static bool build_header_lines(const http_headers_t &headers,
+                                 std::wstring &out) noexcept {
     try {
       std::string lines;
       for (const auto &h : headers) {
@@ -1058,13 +1103,11 @@ protected:
         lines += h.second;
         lines += "\r\n";
       }
-      header_lines = widen_string(lines);
-      built = header_lines.empty() == lines.empty();
+      out = widen_string(lines);
+      return out.empty() == lines.empty();
     } catch (...) {
-      built = false;
+      return false;
     }
-    return built ? put_response(pending.args.get(), status, header_lines, body)
-                 : put_fail_closed_response(pending.args.get());
   }
 
   // When no response at all can be set the request stays pending (completing
@@ -1080,6 +1123,260 @@ protected:
       return;
     }
     complete_and_erase_pending_request(found);
+  }
+
+  // Streamed responses (see webview_begin_response). The stream is made and
+  // registered here, on the caller's thread, so chunks written right after
+  // this returns are kept; the response itself is set on the UI thread.
+  noresult begin_response_impl(uint64_t request_id, int status,
+                               http_headers_t headers) override {
+    com_ptr<streaming_istream> stream{new streaming_istream{}};
+    {
+      std::lock_guard<std::mutex> lock{m_streams_mutex};
+      // NOLINTNEXTLINE(readability-container-contains): contains() requires C++20
+      if (m_active_streams.count(request_id) > 0) {
+        return error_info{WEBVIEW_ERROR_DUPLICATE,
+                          "a response for this request has already begun"};
+      }
+      m_active_streams.emplace(request_id, stream);
+    }
+    noresult res;
+    try {
+      res = dispatch_if_alive([this, request_id, status, headers, stream] {
+        start_streamed_response(request_id, status, headers, stream);
+      });
+    } catch (...) {
+      drop_stream(request_id, stream);
+      throw;
+    }
+    if (!res.ok()) {
+      drop_stream(request_id, stream);
+    }
+    return res;
+  }
+
+  // Any thread: the stream is free-threaded, so no trip to the UI thread.
+  noresult write_response_chunk_impl(uint64_t request_id,
+                                     std::string chunk) override {
+    com_ptr<streaming_istream> stream;
+    {
+      std::lock_guard<std::mutex> lock{m_streams_mutex};
+      auto found = m_active_streams.find(request_id);
+      if (found == m_active_streams.end()) {
+        return {}; // ended, never begun, or the webview is going away
+      }
+      if (found->second->is_abandoned()) {
+        // WebView2 let go of the response (the page cancelled it): nobody
+        // will read these bytes, so stop keeping them.
+        found->second->abort();
+        m_active_streams.erase(found);
+        return {};
+      }
+      stream = found->second;
+    }
+    stream->push(chunk.data(), chunk.size());
+    return {};
+  }
+
+  noresult end_response_impl(uint64_t request_id) override {
+    com_ptr<streaming_istream> stream;
+    {
+      std::lock_guard<std::mutex> lock{m_streams_mutex};
+      auto found = m_active_streams.find(request_id);
+      if (found == m_active_streams.end()) {
+        return {}; // already ended, or never begun
+      }
+      stream = std::move(found->second);
+      m_active_streams.erase(found);
+    }
+    stream->finish();
+    return {};
+  }
+
+  // UI thread. Sets the streamed response on the deferred request and
+  // completes it; WebView2 then reads the body from the stream on its own
+  // thread. When the request is gone (answered, cancelled) the stream is
+  // dropped; when the response cannot be set the request gets the fallback
+  // 500 and the stream is dropped.
+  void start_streamed_response(uint64_t request_id, int status,
+                               const http_headers_t &headers,
+                               const com_ptr<streaming_istream> &stream) {
+    forget_submitted_request(request_id);
+    auto found = m_pending_requests.find(request_id);
+    if (found == m_pending_requests.end()) {
+      drop_stream(request_id, stream);
+      return;
+    }
+    std::wstring header_lines;
+    HRESULT hr = E_FAIL;
+    if (build_header_lines(headers, header_lines)) {
+      try {
+        hr = try_put_stream_response(found->second.args.get(), status,
+                                     header_lines, stream.get());
+      } catch (...) {
+        hr = E_FAIL;
+      }
+    }
+    if (FAILED(hr)) {
+      drop_stream(request_id, stream);
+      if (!put_fail_closed_response(found->second.args.get())) {
+        return; // left deferred; abort_pending_requests() releases it
+      }
+    } else {
+      stream->set_handed_off();
+    }
+    complete_and_erase_pending_request(found);
+  }
+
+  HRESULT try_put_stream_response(
+      ICoreWebView2WebResourceRequestedEventArgs *args, int status,
+      const std::wstring &headers, IStream *stream) {
+    auto *env = m_com_handler ? m_com_handler->environment() : nullptr;
+    if (!env || !args || !stream) {
+      return E_POINTER;
+    }
+    auto reason = widen_string(http_reason_phrase(status));
+    com_ptr<ICoreWebView2WebResourceResponse> response;
+    auto hr = env->CreateWebResourceResponse(stream, status, reason.c_str(),
+                                             headers.c_str(), response.put());
+    if (FAILED(hr)) {
+      return hr;
+    }
+    if (!response) {
+      return E_FAIL;
+    }
+    return args->put_Response(response.get());
+  }
+
+  // Aborts stream and forgets it, if it is still the one registered.
+  void drop_stream(uint64_t request_id,
+                   const com_ptr<streaming_istream> &stream) noexcept {
+    {
+      std::lock_guard<std::mutex> lock{m_streams_mutex};
+      auto found = m_active_streams.find(request_id);
+      if (found != m_active_streams.end() &&
+          found->second.get() == stream.get()) {
+        m_active_streams.erase(found);
+      }
+    }
+    if (stream) {
+      stream->abort();
+    }
+  }
+
+  // Ends every streamed body still open; a blocked Read() returns E_ABORT.
+  void abort_active_streams() noexcept {
+    std::map<uint64_t, com_ptr<streaming_istream>> streams;
+    {
+      std::lock_guard<std::mutex> lock{m_streams_mutex};
+      streams.swap(m_active_streams);
+    }
+    for (auto &entry : streams) {
+      if (entry.second) {
+        entry.second->abort();
+      }
+    }
+  }
+
+  // File drops (see webview_set_file_drop_handler). The drop script is
+  // always installed; this flips whether it takes file drops, for the
+  // current document and every one after it.
+  noresult set_file_drop_handler_impl(bool enabled) override {
+    if (enabled == m_file_drop_enabled) {
+      return {};
+    }
+    m_file_drop_enabled = enabled;
+    if (!m_webview) {
+      return {}; // embed() installs the script with the current value
+    }
+    if (m_file_drop_script) {
+      m_file_drop_script =
+          replace_user_script(*m_file_drop_script, create_file_drop_script());
+    }
+    return eval(std::string{"if (window === window.top) {"
+                            " window.__webview_file_drop_enabled__ = "} +
+                (enabled ? "true" : "false") + "; }");
+  }
+
+  // Top-level document only, like the init script. While enabled, a drag
+  // that carries files is accepted (dragover) and its drop is kept from the
+  // browser's default (opening the file) and posted to the host with the
+  // File objects, whose paths WebView2 reveals only to the host. Page
+  // listeners still see both events.
+  std::string create_file_drop_script() const {
+    return std::string{} + "(function() {\n\
+  'use strict';\n\
+  if (window !== window.top) {\n\
+    return;\n\
+  }\n\
+  window.__webview_file_drop_enabled__ = " +
+           (m_file_drop_enabled ? "true" : "false") + ";\n\
+  function carriesFiles(e) {\n\
+    return !!(window.__webview_file_drop_enabled__ && e.dataTransfer &&\n\
+      e.dataTransfer.types &&\n\
+      Array.from(e.dataTransfer.types).includes('Files'));\n\
+  }\n\
+  window.addEventListener('dragover', function(e) {\n\
+    if (carriesFiles(e)) {\n\
+      e.preventDefault();\n\
+    }\n\
+  }, true);\n\
+  window.addEventListener('drop', function(e) {\n\
+    if (!carriesFiles(e)) {\n\
+      return;\n\
+    }\n\
+    e.preventDefault();\n\
+    if (e.dataTransfer.files && e.dataTransfer.files.length &&\n\
+        window.chrome && window.chrome.webview &&\n\
+        window.chrome.webview.postMessageWithAdditionalObjects) {\n\
+      window.chrome.webview.postMessageWithAdditionalObjects(\n\
+        '__sweetview_file_drop__', Array.from(e.dataTransfer.files));\n\
+    }\n\
+  }, true);\n\
+})()";
+  }
+
+  // UI thread: the drop script's message. Reads each attached File's path
+  // (ICoreWebView2File) and hands the paths to the file drop handler.
+  void on_file_drop_message(ICoreWebView2WebMessageReceivedEventArgs *args) {
+    if (!file_drop_handler() || !args) {
+      return;
+    }
+    com_ptr<ICoreWebView2WebMessageReceivedEventArgs2> args2;
+    if (FAILED(args->QueryInterface(
+            __uuidof(ICoreWebView2WebMessageReceivedEventArgs2),
+            args2.put_void())) ||
+        !args2) {
+      return; // a WebView2 Runtime too old to attach objects
+    }
+    com_ptr<ICoreWebView2ObjectCollectionView> objects;
+    if (FAILED(args2->get_AdditionalObjects(objects.put())) || !objects) {
+      return;
+    }
+    UINT32 count = 0;
+    if (FAILED(objects->get_Count(&count))) {
+      return;
+    }
+    std::vector<std::string> paths;
+    for (UINT32 i = 0; i < count; ++i) {
+      com_ptr<IUnknown> item;
+      if (FAILED(objects->GetValueAtIndex(i, item.put())) || !item) {
+        continue;
+      }
+      com_ptr<ICoreWebView2File> file;
+      if (FAILED(item->QueryInterface(__uuidof(ICoreWebView2File),
+                                      file.put_void())) ||
+          !file) {
+        continue; // not a file from the operating system
+      }
+      cotaskmem_wstr wpath;
+      if (FAILED(file->get_Path(wpath.put())) || !wpath.get() ||
+          !*wpath.get()) {
+        continue;
+      }
+      paths.push_back(wpath.narrow());
+    }
+    deliver_file_drop(paths);
   }
 
   // Releases every request still open without answering it. Runs after the
@@ -1432,6 +1729,11 @@ private:
           flag.clear();
         });
 
+    m_com_handler->set_file_drop_message_handler(
+        [this](ICoreWebView2WebMessageReceivedEventArgs *args) {
+          on_file_drop_message(args);
+        });
+
     m_com_handler->set_attempt_handler([&] {
       return m_webview2_loader.create_environment_with_options(
           nullptr, userDataFolder, nullptr, m_com_handler);
@@ -1473,6 +1775,7 @@ private:
     add_init_script("function(message) {\n\
   return window.chrome.webview.postMessage(message);\n\
 }");
+    m_file_drop_script = add_user_script(create_file_drop_script());
     auto served = serve_assets();
     if (!served.ok()) {
       return served;
@@ -1581,6 +1884,14 @@ private:
   bool m_is_window_shown{};
   // Requests handed to the request handler and not yet answered.
   std::map<uint64_t, pending_request_t> m_pending_requests;
+  // Streamed bodies begun and not yet ended, by request id. Guarded by
+  // m_streams_mutex: chunks arrive from any thread.
+  std::mutex m_streams_mutex;
+  std::map<uint64_t, com_ptr<streaming_istream>> m_active_streams;
+  // The drop script (see create_file_drop_script) and whether it takes
+  // file drops.
+  user_script *m_file_drop_script{};
+  bool m_file_drop_enabled{};
   // Work queued by dispatch_impl, run in order by the message window.
   std::mutex m_dispatch_mutex;
   std::deque<dispatch_fn_t> m_dispatch_queue;

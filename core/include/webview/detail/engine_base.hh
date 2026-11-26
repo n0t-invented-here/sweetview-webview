@@ -45,6 +45,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_set>
+#include <vector>
 
 namespace webview {
 namespace detail {
@@ -259,6 +260,88 @@ window.__webview__.onUnbind(" +
     return res;
   }
 
+  // Starts a streamed answer (see webview_begin_response). Validated exactly
+  // like complete_request; the backend takes it from there and may be called
+  // on any thread. The id is recorded as submitted until the backend's UI
+  // thread work has taken the request, so a handler that begins a response
+  // and then throws does not have it replaced by the fallback 500.
+  noresult begin_response(uint64_t request_id, int status,
+                          const char *headers_json) {
+    if (!is_alive()) {
+      return error_info{WEBVIEW_ERROR_INVALID_STATE,
+                        "the webview is being destroyed"};
+    }
+    if (request_id == 0 || status < 100 || status > 599) {
+      return error_info{WEBVIEW_ERROR_INVALID_ARGUMENT};
+    }
+    http_headers_t headers;
+    if (headers_json && !http_headers_from_json(headers_json, headers)) {
+      return error_info{
+          WEBVIEW_ERROR_INVALID_ARGUMENT,
+          "headers_json is not valid strict JSON (an object or "
+          "array of pairs) of valid HTTP header names and values"};
+    }
+    const bool inserted = [&] {
+      std::lock_guard<std::mutex> lock{m_submitted_mutex};
+      return m_submitted_requests.insert(request_id).second;
+    }();
+    noresult res;
+    try {
+      res = begin_response_impl(request_id, status, std::move(headers));
+    } catch (...) {
+      if (inserted) {
+        forget_submitted_request(request_id);
+      }
+      throw;
+    }
+    if (!res.ok() && inserted) {
+      forget_submitted_request(request_id);
+    }
+    return res;
+  }
+
+  // Appends body bytes to a streamed answer; copies them before returning.
+  noresult write_response_chunk(uint64_t request_id, const void *chunk,
+                                size_t chunk_len) {
+    if (!is_alive()) {
+      return error_info{WEBVIEW_ERROR_INVALID_STATE,
+                        "the webview is being destroyed"};
+    }
+    if (request_id == 0 || (!chunk && chunk_len > 0)) {
+      return error_info{WEBVIEW_ERROR_INVALID_ARGUMENT};
+    }
+    if (chunk_len >
+        static_cast<size_t>((std::numeric_limits<std::uint32_t>::max)())) {
+      return error_info{WEBVIEW_ERROR_INVALID_ARGUMENT,
+                        "chunk_len is larger than 4 GiB - 1"};
+    }
+    if (chunk_len == 0) {
+      return {};
+    }
+    return write_response_chunk_impl(
+        request_id, std::string(static_cast<const char *>(chunk), chunk_len));
+  }
+
+  // Ends a streamed answer.
+  noresult end_response(uint64_t request_id) {
+    if (!is_alive()) {
+      return error_info{WEBVIEW_ERROR_INVALID_STATE,
+                        "the webview is being destroyed"};
+    }
+    if (request_id == 0) {
+      return error_info{WEBVIEW_ERROR_INVALID_ARGUMENT};
+    }
+    return end_response_impl(request_id);
+  }
+
+  // Files dropped from the operating system go to fn (see
+  // webview_set_file_drop_handler); NULL hands drops back to the page.
+  noresult set_file_drop_handler(webview_file_drop_handler_t fn, void *arg) {
+    m_file_drop_handler = fn;
+    m_file_drop_handler_arg = fn ? arg : nullptr;
+    return set_file_drop_handler_impl(fn != nullptr);
+  }
+
   // True while an answer from webview_complete_request for request_id is
   // queued and has not run yet.
   bool is_request_submitted(uint64_t request_id) const {
@@ -314,6 +397,62 @@ protected:
                                      const std::string & /*body*/) {}
   // Backends without external drag-and-drop control accept and ignore it.
   virtual noresult set_allow_external_drop_impl(bool /*allow*/) { return {}; }
+  // Streaming, for backends that serve requests. May run on any thread; each
+  // backend hands what needs the UI thread to it (see dispatch_if_alive).
+  // The default, for backends that serve none, accepts and drops everything.
+  virtual noresult begin_response_impl(uint64_t request_id, int /*status*/,
+                                       http_headers_t /*headers*/) {
+    forget_submitted_request(request_id);
+    return {};
+  }
+  virtual noresult write_response_chunk_impl(uint64_t /*request_id*/,
+                                             std::string /*chunk*/) {
+    return {};
+  }
+  virtual noresult end_response_impl(uint64_t /*request_id*/) { return {}; }
+  // Backends without OS file drops accept and ignore the handler.
+  virtual noresult set_file_drop_handler_impl(bool /*enabled*/) { return {}; }
+
+  webview_file_drop_handler_t file_drop_handler() const {
+    return m_file_drop_handler;
+  }
+
+  // Hands dropped paths to the file drop handler as a JSON array of strings.
+  // Runs on the UI thread. Nothing is called when no handler is set or no
+  // path is given.
+  void deliver_file_drop(const std::vector<std::string> &paths) {
+    auto fn = m_file_drop_handler;
+    if (!fn || paths.empty()) {
+      return;
+    }
+    std::string json = "[";
+    bool first = true;
+    for (const auto &path : paths) {
+      if (!first) {
+        json += ',';
+      }
+      first = false;
+      json += json_escape(path);
+    }
+    json += ']';
+    fn(json.c_str(), m_file_drop_handler_arg);
+  }
+
+  // Queues f on the UI thread; f does nothing if the engine is destroyed
+  // before it runs.
+  noresult dispatch_if_alive(std::function<void()> f) {
+    auto alive = m_alive;
+    return dispatch([alive, f] {
+      if (alive->load()) {
+        f();
+      }
+    });
+  }
+
+  void forget_submitted_request(uint64_t request_id) noexcept {
+    std::lock_guard<std::mutex> lock{m_submitted_mutex};
+    m_submitted_requests.erase(request_id);
+  }
 
   webview_request_handler_t request_handler() const {
     return m_request_handler;
@@ -527,11 +666,6 @@ protected:
   bool owns_window() const { return m_owns_window; }
 
 private:
-  void forget_submitted_request(uint64_t request_id) noexcept {
-    std::lock_guard<std::mutex> lock{m_submitted_mutex};
-    m_submitted_requests.erase(request_id);
-  }
-
   static std::atomic_uint &window_ref_count() {
     static std::atomic_uint ref_count{0};
     return ref_count;
@@ -551,6 +685,8 @@ private:
   std::map<std::string, asset_t> m_assets;
   webview_request_handler_t m_request_handler{};
   void *m_request_handler_arg{};
+  webview_file_drop_handler_t m_file_drop_handler{};
+  void *m_file_drop_handler_arg{};
   // False once the engine is being destroyed; see mark_destroying.
   std::shared_ptr<std::atomic<bool>> m_alive{
       std::make_shared<std::atomic<bool>>(true)};

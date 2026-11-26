@@ -502,3 +502,122 @@ TEST_CASE("Mouse and keyboard hooks: either order, either removed first") {
   REQUIRE(webview_keyboard_hook_remove() == WEBVIEW_ERROR_NOT_FOUND);
 }
 #endif
+
+#if defined(_WIN32)
+#include <chrono>
+#include <thread>
+
+// The body of a streamed response (webview_begin_response): bytes pushed from
+// one thread are read on another as they arrive, the end is S_FALSE after the
+// last byte, and an abort wakes a blocked reader with E_ABORT.
+TEST_CASE("Streaming IStream: push, read, end of stream, abort") {
+  using webview::detail::streaming_istream;
+  auto *stream = new streaming_istream{};
+
+  // The COM surface: a read-only, forward-only, agile IStream.
+  {
+    IStream *as_stream = nullptr;
+    REQUIRE(stream->QueryInterface(IID_IStream,
+                                   reinterpret_cast<void **>(&as_stream)) ==
+            S_OK);
+    REQUIRE(as_stream == stream);
+    as_stream->Release();
+    IUnknown *agile = nullptr;
+    REQUIRE(stream->QueryInterface(IID_IAgileObject,
+                                   reinterpret_cast<void **>(&agile)) == S_OK);
+    agile->Release();
+    LARGE_INTEGER zero{};
+    REQUIRE(stream->Seek(zero, STREAM_SEEK_SET, nullptr) == E_NOTIMPL);
+    REQUIRE(stream->Write("x", 1, nullptr) == E_NOTIMPL);
+    REQUIRE(stream->Clone(nullptr) == E_NOTIMPL);
+    STATSTG stat{};
+    REQUIRE(stream->Stat(&stat, STATFLAG_NONAME) == S_OK);
+    REQUIRE(stat.type == STGTY_STREAM);
+    REQUIRE(stat.cbSize.QuadPart == 0);
+  }
+
+  // Bytes already pushed are read at once, in pieces no larger than asked.
+  REQUIRE(stream->push("hello", 5));
+  char buf[16]{};
+  ULONG read = 0;
+  REQUIRE(stream->Read(buf, 3, &read) == S_OK);
+  REQUIRE(read == 3);
+  REQUIRE(std::string(buf, read) == "hel");
+  REQUIRE(stream->Read(buf, sizeof(buf), &read) == S_OK);
+  REQUIRE(std::string(buf, read) == "lo");
+  REQUIRE(stream->buffered() == 0);
+
+  // A read with nothing buffered blocks until a chunk arrives.
+  {
+    std::thread writer{[stream] {
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      stream->push("data: 1\n\n", 9);
+    }};
+    auto start = std::chrono::steady_clock::now();
+    REQUIRE(stream->Read(buf, sizeof(buf), &read) == S_OK);
+    auto waited = std::chrono::steady_clock::now() - start;
+    writer.join();
+    REQUIRE(std::string(buf, read) == "data: 1\n\n");
+    REQUIRE(waited >= std::chrono::milliseconds(50));
+  }
+
+  // After finish(), what is buffered is still read, then S_FALSE with 0.
+  REQUIRE(stream->push("tail", 4));
+  stream->finish();
+  REQUIRE(stream->is_closed());
+  REQUIRE_FALSE(stream->push("late", 4));
+  REQUIRE(stream->Read(buf, sizeof(buf), &read) == S_OK);
+  REQUIRE(std::string(buf, read) == "tail");
+  REQUIRE(stream->Read(buf, sizeof(buf), &read) == S_FALSE);
+  REQUIRE(read == 0);
+
+  // Abandoned only once handed off and every other reference is gone.
+  REQUIRE_FALSE(stream->is_abandoned());
+  stream->set_handed_off();
+  stream->AddRef();
+  REQUIRE_FALSE(stream->is_abandoned());
+  stream->Release();
+  REQUIRE(stream->is_abandoned());
+  stream->Release();
+
+  // abort() wakes a blocked reader with E_ABORT and drops what is buffered.
+  auto *aborted = new streaming_istream{};
+  {
+    std::thread aborter{[aborted] {
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      aborted->abort();
+    }};
+    REQUIRE(aborted->Read(buf, sizeof(buf), &read) == E_ABORT);
+    aborter.join();
+    REQUIRE(read == 0);
+    REQUIRE_FALSE(aborted->push("x", 1));
+  }
+  aborted->Release();
+  auto *dropped = new streaming_istream{};
+  REQUIRE(dropped->push("kept?", 5));
+  dropped->abort();
+  REQUIRE(dropped->buffered() == 0);
+  REQUIRE(dropped->Read(buf, sizeof(buf), &read) == E_ABORT);
+  dropped->Release();
+}
+
+// Streaming and file drop entry points refuse bad handles and arguments the
+// same way webview_complete_request does, before touching any instance.
+TEST_CASE("Streaming and file drop C API: argument checks") {
+  REQUIRE(webview_begin_response(nullptr, 1, 200, nullptr) ==
+          WEBVIEW_ERROR_INVALID_ARGUMENT);
+  REQUIRE(webview_write_response_chunk(nullptr, 1, "x", 1) ==
+          WEBVIEW_ERROR_INVALID_ARGUMENT);
+  REQUIRE(webview_end_response(nullptr, 1) == WEBVIEW_ERROR_INVALID_ARGUMENT);
+  REQUIRE(webview_set_file_drop_handler(nullptr, nullptr, nullptr) ==
+          WEBVIEW_ERROR_INVALID_ARGUMENT);
+  // A handle that never came from webview_create is not a live instance.
+  int not_a_webview = 0;
+  REQUIRE(webview_begin_response(&not_a_webview, 1, 200, nullptr) ==
+          WEBVIEW_ERROR_INVALID_STATE);
+  REQUIRE(webview_write_response_chunk(&not_a_webview, 1, "x", 1) ==
+          WEBVIEW_ERROR_INVALID_STATE);
+  REQUIRE(webview_end_response(&not_a_webview, 1) ==
+          WEBVIEW_ERROR_INVALID_STATE);
+}
+#endif
