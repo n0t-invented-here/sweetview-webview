@@ -70,7 +70,6 @@ TEST_CASE("Request handler: headers to and from JSON") {
   using webview::detail::http_headers_from_json;
   using webview::detail::http_headers_t;
   using webview::detail::http_headers_to_json;
-  using webview::detail::http_reason_phrase;
 
   // Request headers go out as an array of pairs, escaped.
   REQUIRE(http_headers_to_json({}) == "[]");
@@ -95,18 +94,99 @@ TEST_CASE("Request handler: headers to and from JSON") {
   REQUIRE(h[0].second == "a=1");
   REQUIRE(h[1].second == "b=2");
 
-  // CR and LF never survive, so no header can be injected.
+  // CR, LF and other control characters fail the parse, so no header can be
+  // injected; tab is allowed in values.
   h.clear();
-  REQUIRE(http_headers_from_json(
-      R"({"X-Evil": "a\r\nSet-Cookie: pwned=1", "X\nY": "z"})", h));
-  REQUIRE(h.size() == 2);
-  REQUIRE(h[0].second == "aSet-Cookie: pwned=1");
-  REQUIRE(h[1].first == "XY");
+  REQUIRE_FALSE(
+      http_headers_from_json(R"({"X-Evil": "a\r\nSet-Cookie: pwned=1"})", h));
+  REQUIRE_FALSE(http_headers_from_json(R"({"X\nY": "z"})", h));
+  REQUIRE_FALSE(http_headers_from_json(R"({"X-Bell": "a\u0007b"})", h));
+  REQUIRE(http_headers_from_json(R"({"X-Tab": "a\tb"})", h));
+  REQUIRE(h.size() == 1);
+  REQUIRE(h[0].second == "a\tb");
+
+  // A failed parse leaves out untouched.
+  REQUIRE_FALSE(http_headers_from_json(R"({"X-A": "1", "Bad Name": "2"})", h));
+  REQUIRE(h.size() == 1);
+  REQUIRE(h[0].first == "X-Tab");
 
   // Unicode escapes decode to UTF-8, surrogate pairs included.
   h.clear();
   REQUIRE(http_headers_from_json(R"({"X-U": "é😀"})", h));
   REQUIRE(h[0].second == "\xc3\xa9\xf0\x9f\x98\x80");
+  h.clear();
+  REQUIRE(http_headers_from_json("{\"X-U\": \"\xc3\xa9\"}", h));
+  REQUIRE(h[0].second == "\xc3\xa9");
+}
+
+TEST_CASE("Request handler: strict response header JSON") {
+  using webview::detail::http_headers_from_json;
+  using webview::detail::http_headers_t;
+  using webview::detail::http_reason_phrase;
+  http_headers_t h;
+
+  // Literals end where the grammar says.
+  REQUIRE_FALSE(http_headers_from_json(R"({"X-Example":trueish})", h));
+  REQUIRE_FALSE(http_headers_from_json(R"({"X-Example":nullx})", h));
+  REQUIRE_FALSE(http_headers_from_json(R"({"X-Example":falsey})", h));
+  REQUIRE_FALSE(http_headers_from_json(R"({"X-Example":tru})", h));
+  REQUIRE_FALSE(http_headers_from_json(R"({"X-Example":12abc})", h));
+  REQUIRE_FALSE(http_headers_from_json(R"({"X-Example":01})", h));
+  REQUIRE_FALSE(http_headers_from_json(R"({"X-Example":1.})", h));
+  REQUIRE_FALSE(http_headers_from_json(R"({"X-Example":+1})", h));
+  REQUIRE_FALSE(http_headers_from_json(R"({"X-Example":1e})", h));
+  REQUIRE_FALSE(http_headers_from_json(R"({"X-Example":undefined})", h));
+  REQUIRE(h.empty());
+  REQUIRE(http_headers_from_json(
+      R"({"X-T": true, "X-F": false, "X-N": -1.5e+3, "X-Z": 0})", h));
+  REQUIRE(h.size() == 4);
+  REQUIRE(h[0].second == "true");
+  REQUIRE(h[1].second == "false");
+  REQUIRE(h[2].second == "-1.5e+3");
+  REQUIRE(h[3].second == "0");
+
+  // Raw control characters inside a string, NUL included.
+  h.clear();
+  REQUIRE_FALSE(http_headers_from_json("{\"X-A\": \"a\tb\"}", h));
+  REQUIRE_FALSE(http_headers_from_json("{\"X-A\": \"a\nb\"}", h));
+  REQUIRE_FALSE(
+      http_headers_from_json(std::string("{\"X-A\": \"a\0b\"}", 14), h));
+  REQUIRE_FALSE(
+      http_headers_from_json(std::string("{\"X-\0A\": \"b\"}", 13), h));
+
+  // U+0000 escaped would still cut a C string short.
+  REQUIRE_FALSE(http_headers_from_json(R"({"X-A": "a\u0000b"})", h));
+  REQUIRE_FALSE(http_headers_from_json(R"({"X-\u0000": "b"})", h));
+
+  // Lone or unmatched UTF-16 surrogates.
+  REQUIRE_FALSE(http_headers_from_json(R"({"X-A": "\ud83d"})", h));
+  REQUIRE_FALSE(http_headers_from_json(R"({"X-A": "\ud83dx"})", h));
+  REQUIRE_FALSE(http_headers_from_json(R"({"X-A": "\ude00"})", h));
+  REQUIRE_FALSE(http_headers_from_json(R"({"X-A": "\ud83dA"})", h));
+  REQUIRE_FALSE(http_headers_from_json(R"({"X-A": "\ud83d\ud83d"})", h));
+
+  // Raw bytes must be valid UTF-8: no stray continuation bytes, overlong
+  // forms, encoded surrogates, truncated sequences or code points past
+  // U+10FFFF.
+  REQUIRE_FALSE(http_headers_from_json("{\"X-A\": \"\x80\"}", h));
+  REQUIRE_FALSE(http_headers_from_json("{\"X-A\": \"\xc0\xaf\"}", h));
+  REQUIRE_FALSE(http_headers_from_json("{\"X-A\": \"\xed\xa0\x80\"}", h));
+  REQUIRE_FALSE(http_headers_from_json("{\"X-A\": \"\xe2\x82\"}", h));
+  REQUIRE_FALSE(http_headers_from_json("{\"X-A\": \"\xf4\x90\x80\x80\"}", h));
+
+  // Header names are RFC 9110 tokens: not empty, no spaces, colons,
+  // separators or non-ASCII.
+  REQUIRE_FALSE(http_headers_from_json(R"({"": "a"})", h));
+  REQUIRE_FALSE(http_headers_from_json(R"({"Bad Name": "a"})", h));
+  REQUIRE_FALSE(http_headers_from_json(R"({"X-A:": "a"})", h));
+  REQUIRE_FALSE(http_headers_from_json("{\"X(A)\": \"a\"}", h));
+  REQUIRE_FALSE(http_headers_from_json(R"({"X-é": "a"})", h));
+  REQUIRE_FALSE(http_headers_from_json(R"([["Bad Name", "a"]])", h));
+  // A bad name fails even when its value is null.
+  REQUIRE_FALSE(http_headers_from_json(R"({"Bad Name": null})", h));
+  REQUIRE(h.empty());
+  REQUIRE(http_headers_from_json(R"({"X-Ok_1.2!#$%&'*+^`|~": "a"})", h));
+  REQUIRE(h.size() == 1);
 
   // Empty input is no headers; anything else is an error.
   h.clear();

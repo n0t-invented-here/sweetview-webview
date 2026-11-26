@@ -50,6 +50,7 @@
 #include "../platform/darwin/webkit/webkit.hh"
 #include "../user_script.hh"
 
+#include <algorithm>
 #include <atomic>
 #include <cctype>
 #include <cstdint>
@@ -58,6 +59,7 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include <objc/objc-runtime.h>
 
@@ -106,6 +108,9 @@ public:
 
   virtual ~cocoa_wkwebview_engine() {
     objc::autoreleasepool arp;
+    // Answers webview_complete_request queued on the main queue do nothing
+    // from here on, even those that run after this engine is deleted.
+    mark_destroying();
     if (m_url_scheme_handler) {
       // WebKit may still start or stop tasks on the handler while the
       // WKWebView winds down; they must not reach this engine.
@@ -388,21 +393,40 @@ private:
     // and all, "text/html; charset=utf-8") the way it would from a server. A
     // plain NSURLResponse takes a bare MIME type; given one with parameters
     // it shows HTML as text and refuses module scripts.
+    //
+    // NSHTTPURLResponse holds one value per name, so repeated names are
+    // merged first. Names match without regard to case (RFC 9110 5.1) and
+    // keep the casing first seen. Repeats are joined with ", " the way HTTP
+    // allows, except Set-Cookie, which cannot be joined (RFC 9110 5.3): the
+    // first Set-Cookie is kept and later ones are dropped.
+    struct merged_header_t {
+      std::string lower_name;
+      std::string name;
+      std::string value;
+    };
+    std::vector<merged_header_t> merged;
+    for (const auto &h : headers) {
+      auto lower_name = h.first;
+      for (auto &c : lower_name) {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+      }
+      auto found = std::find_if(
+          merged.begin(), merged.end(),
+          [&](const merged_header_t &m) { return m.lower_name == lower_name; });
+      if (found == merged.end()) {
+        merged.push_back(merged_header_t{lower_name, h.first, h.second});
+      } else if (lower_name != "set-cookie") {
+        found->value += ", ";
+        found->value += h.second;
+      }
+    }
     auto dict = objc::msg_send<id>(objc::get_class("NSMutableDictionary"),
                                    objc::selector("dictionary"));
-    for (const auto &h : headers) {
-      auto key = NSString_stringWithUTF8String(h.first);
-      auto value = NSString_stringWithUTF8String(h.second);
+    for (const auto &m : merged) {
+      auto key = NSString_stringWithUTF8String(m.name);
+      auto value = NSString_stringWithUTF8String(m.value);
       if (!key || !value) {
         continue; // not valid UTF-8
-      }
-      // NSHTTPURLResponse holds one value per name; repeats are joined the
-      // way HTTP allows.
-      auto existing =
-          objc::msg_send<id>(dict, objc::selector("objectForKey:"), key);
-      if (existing) {
-        value = NSString_stringWithUTF8String(
-            std::string(NSString_get_UTF8String(existing)) + ", " + h.second);
       }
       objc::msg_send<void>(dict, objc::selector("setObject:forKey:"), value,
                            key);
@@ -501,20 +525,43 @@ private:
       }
     } else if (auto stream = objc::msg_send<id>(
                    request, objc::selector("HTTPBodyStream"))) {
-      // Some bodies arrive only as a stream.
+      // Some bodies arrive only as a stream. read:maxLength: returns 0 at
+      // the end and a negative count on error.
       objc::msg_send<void>(stream, objc::selector("open"));
       uint8_t buf[16384];
+      bool failed = false;
       for (;;) {
         auto read = objc::msg_send<NSInteger>(
             stream, objc::selector("read:maxLength:"),
             static_cast<uint8_t *>(buf), static_cast<NSUInteger>(sizeof(buf)));
-        if (read <= 0) {
+        if (read < 0) {
+          failed = true;
+          break;
+        }
+        if (read == 0) {
           break;
         }
         body.append(reinterpret_cast<const char *>(buf),
                     static_cast<size_t>(read));
       }
+      id error = failed
+                     ? objc::msg_send<id>(stream, objc::selector("streamError"))
+                     : nullptr;
       objc::msg_send<void>(stream, objc::selector("close"));
+      if (failed) {
+        // A partial body must not reach the handler as if it were whole: the
+        // task fails instead (NSURLErrorUnknown when the stream gives no
+        // error of its own).
+        if (!error) {
+          error = objc::msg_send<id>(
+              objc::get_class("NSError"),
+              objc::selector("errorWithDomain:code:userInfo:"),
+              NSString_stringWithUTF8String("NSURLErrorDomain"),
+              static_cast<NSInteger>(-1), static_cast<id>(nullptr));
+        }
+        objc::msg_send<void>(task, objc::selector("didFailWithError:"), error);
+        return;
+      }
     }
 
     // Held until webview_complete_request answers it or WebKit stops it.

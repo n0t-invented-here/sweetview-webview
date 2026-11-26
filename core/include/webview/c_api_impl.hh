@@ -38,6 +38,11 @@
 #include "types.h"
 #include "version.h"
 
+#include <atomic>
+#include <memory>
+#include <mutex>
+#include <unordered_map>
+
 namespace webview {
 namespace detail {
 
@@ -87,6 +92,23 @@ inline webview *cast_to_webview(void *w) {
   return static_cast<webview *>(w);
 }
 
+// Every webview made by webview_create and not yet passed to
+// webview_destroy, with its alive token. webview_complete_request may run on
+// any thread, so it looks the instance up here, under the lock, instead of
+// trusting the handle: a handle already destroyed (or being destroyed) is
+// refused, and webview_destroy cannot delete the instance while a completion
+// is being queued. Allocated once and never freed, so it outlives every
+// static destructor that might still destroy a webview.
+struct live_instances_t {
+  std::mutex mutex;
+  std::unordered_map<webview_t, std::shared_ptr<std::atomic<bool>>> alive;
+};
+
+inline live_instances_t &live_instances() {
+  static auto *instances = new live_instances_t{};
+  return *instances;
+}
+
 } // namespace detail
 } // namespace webview
 
@@ -98,16 +120,33 @@ WEBVIEW_API webview_t webview_create(int debug, void *wnd) {
         return new webview::webview{static_cast<bool>(debug), wnd};
       },
       [&](webview::webview *w_) { w = w_; });
-  if (err == WEBVIEW_ERROR_OK) {
-    return w;
+  if (err != WEBVIEW_ERROR_OK) {
+    return nullptr;
   }
-  return nullptr;
+  try {
+    auto &instances = live_instances();
+    std::lock_guard<std::mutex> lock{instances.mutex};
+    instances.alive[w] = w->alive_token();
+  } catch (...) {
+    delete w;
+    return nullptr;
+  }
+  return w;
 }
 
 WEBVIEW_API webview_error_t webview_destroy(webview_t w) {
   using namespace webview::detail;
   return api_filter([=]() -> webview::noresult {
-    delete cast_to_webview(w);
+    auto *instance = cast_to_webview(w);
+    {
+      // First: no completion may be queued from here on, and any already
+      // queued does nothing when it runs.
+      auto &instances = live_instances();
+      std::lock_guard<std::mutex> lock{instances.mutex};
+      instance->mark_destroying();
+      instances.alive.erase(w);
+    }
+    delete instance;
     return {};
   });
 }
@@ -221,11 +260,19 @@ WEBVIEW_API webview_error_t webview_complete_request(webview_t w,
                                                      const void *body,
                                                      size_t body_len) {
   using namespace webview::detail;
-  if (request_id == 0 || status < 100 || status > 599 ||
-      (!body && body_len > 0)) {
+  if (!w) {
     return WEBVIEW_ERROR_INVALID_ARGUMENT;
   }
-  return api_filter([=] {
+  return api_filter([=]() -> webview::noresult {
+    // Held while the answer is validated, copied and queued, so
+    // webview_destroy cannot free the instance in the middle of it.
+    auto &instances = live_instances();
+    std::lock_guard<std::mutex> lock{instances.mutex};
+    auto found = instances.alive.find(w);
+    if (found == instances.alive.end() || !found->second->load()) {
+      return webview::error_info{WEBVIEW_ERROR_INVALID_STATE,
+                                 "the webview is destroyed or being destroyed"};
+    }
     return cast_to_webview(w)->complete_request(request_id, status,
                                                 headers_json, body, body_len);
   });

@@ -216,17 +216,29 @@ WEBVIEW_API webview_error_t webview_set_asset(webview_t w, const char *path,
  *
  * Without a handler both answer 404 for anything with no asset. Passing
  * @p fn NULL removes the handler; requests already handed to it stay open
- * until completed or until the webview is destroyed, which answers them 503.
+ * until completed or until the webview is destroyed (see Remarks for what
+ * destroying does to them).
  *
  * @p fn runs on the UI thread. It must not block: it hands the request off and
  * returns, and the answer goes back with webview_complete_request.
  *
+ * A request whose body cannot be read in full never reaches @p fn: Windows
+ * answers it 500, macOS fails the task with an NSError.
+ *
  * Remarks:
  * - Windows: WebView2's WebResourceRequested event, deferred
- *   (ICoreWebView2Deferral) until the request is completed.
+ *   (ICoreWebView2Deferral) until the request is completed. Requests from
+ *   service workers and shared workers are caught too where the WebView2
+ *   Runtime has ICoreWebView2_22 (Runtime 125 or later); an older Runtime
+ *   only reports requests from documents. When a response cannot be built
+ *   (WebView2 refuses the headers, no memory for the body) the request is
+ *   answered with a bare 500 instead, so it never goes on to the network.
+ *   Destroying the webview answers every request still open with 503.
  * - macOS: a WKURLSchemeHandler for the schemes "webview" and
  *   "webview-frames". A task WebKit stops before it is completed is dropped,
- *   and completing it later does nothing.
+ *   and completing it later does nothing. Destroying the webview releases
+ *   the tasks still open without answering them; WebKit stops them as the
+ *   WKWebView goes.
  * - Linux: accepted and stored; not served.
  *
  * @param w The webview instance.
@@ -239,9 +251,20 @@ WEBVIEW_API webview_error_t webview_set_request_handler(
 /**
  * Answers a request handed to the request handler (see
  * webview_set_request_handler). Safe to call from any thread; the response is
- * delivered on the UI thread. The headers and body are copied before this
- * returns. Completing a request twice, or one the browser has since
- * cancelled, does nothing.
+ * delivered on the UI thread. The headers are checked and the headers and
+ * body are copied before this returns. Completing a request twice, or one the
+ * browser has since cancelled, does nothing.
+ *
+ * Safe to call at any time against webview_destroy on another thread: once
+ * webview_destroy has begun, this returns WEBVIEW_ERROR_INVALID_STATE, and an
+ * answer queued before then does nothing when it runs. @p w must be a handle
+ * from webview_create.
+ *
+ * Repeated header names are merged differently per platform. Windows sends
+ * each [name, value] pair as its own header line. macOS (NSHTTPURLResponse)
+ * holds one value per name: names match without regard to case, repeats are
+ * joined with ", ", and Set-Cookie, which cannot be joined, keeps only the
+ * first value, so macOS answers with at most one Set-Cookie per response.
  *
  * @param w The webview instance.
  * @param request_id The @c request_id the handler received.
@@ -249,11 +272,21 @@ WEBVIEW_API webview_error_t webview_set_request_handler(
  * @param headers_json Response headers, as a JSON object of name to value
  *                     ({"Content-Type": "text/html"}) or a JSON array of
  *                     [name, value] pairs, which allows a name to repeat
- *                     ([["Set-Cookie","a=1"],["Set-Cookie","b=2"]]). CR and
- *                     LF are removed from names and values. NULL or "" for
- *                     none.
+ *                     ([["X-Multi","a"],["X-Multi","b"]]). Values may be
+ *                     strings, numbers or booleans; null drops the header.
+ *                     Parsed as strict JSON: no trailing text, no raw
+ *                     control characters or lone surrogates in strings,
+ *                     valid UTF-8, and no U+0000. Each name must be an
+ *                     RFC 9110 token and each value free of CR, LF, NUL and
+ *                     other control characters but tab. Anything else
+ *                     returns WEBVIEW_ERROR_INVALID_ARGUMENT and answers
+ *                     nothing. NULL or "" for none.
  * @param body The response body, or NULL when @p body_len is 0.
- * @param body_len Length of @p body in bytes.
+ * @param body_len Length of @p body in bytes, at most 4294967295 (UINT32_MAX);
+ *                 larger returns WEBVIEW_ERROR_INVALID_ARGUMENT.
+ * @return WEBVIEW_ERROR_INVALID_STATE when @p w is destroyed or being
+ *         destroyed; WEBVIEW_ERROR_INVALID_ARGUMENT for a bad argument or bad
+ *         headers.
  */
 WEBVIEW_API webview_error_t webview_complete_request(webview_t w,
                                                      uint64_t request_id,

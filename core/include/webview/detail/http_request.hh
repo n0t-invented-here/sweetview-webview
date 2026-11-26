@@ -64,24 +64,68 @@ inline std::string http_headers_to_json(const http_headers_t &headers) {
   return out;
 }
 
-// Removes CR and LF so a name or value can never start a new header line.
-inline std::string http_header_sanitize(const std::string &s) {
-  std::string out;
-  out.reserve(s.size());
-  for (char c : s) {
-    if (c != '\r' && c != '\n') {
-      out += c;
-    }
+// RFC 9110 5.1: a field name is a token, one or more tchar.
+inline bool http_is_tchar(unsigned char c) {
+  if ((c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') ||
+      (c >= 'A' && c <= 'Z')) {
+    return true;
   }
-  return out;
+  switch (c) {
+  case '!':
+  case '#':
+  case '$':
+  case '%':
+  case '&':
+  case '\'':
+  case '*':
+  case '+':
+  case '-':
+  case '.':
+  case '^':
+  case '_':
+  case '`':
+  case '|':
+  case '~':
+    return true;
+  default:
+    return false;
+  }
 }
 
-// A small JSON reader for exactly what response headers need: a JSON object
-// of name to value, or a JSON array of [name, value] pairs. Values may be
-// strings, numbers, booleans or null (null drops the header).
+inline bool http_is_valid_header_name(const std::string &name) {
+  if (name.empty()) {
+    return false;
+  }
+  for (char c : name) {
+    if (!http_is_tchar(static_cast<unsigned char>(c))) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// RFC 9110 5.5: a field value never holds CR, LF or NUL, and no other control
+// character except horizontal tab. Bytes from 0x80 up (UTF-8, obs-text) pass.
+inline bool http_is_valid_header_value(const std::string &value) {
+  for (char ch : value) {
+    auto c = static_cast<unsigned char>(ch);
+    if ((c < 0x20 && c != '\t') || c == 0x7F) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// A strict reader for exactly what response headers need: a JSON object of
+// name to value, or a JSON array of [name, value] pairs. Values may be
+// strings, numbers, booleans or null (null drops the header). Follows the
+// JSON grammar (RFC 8259) to the letter: literals end where the grammar says,
+// strings hold no raw control characters, every \u escape is a whole code
+// point (no lone surrogates), and the text is valid UTF-8. U+0000 is refused
+// as well, raw or escaped, since names and values become C strings.
 class http_headers_json_reader {
 public:
-  http_headers_json_reader(const std::string &s) : m_s(s) {}
+  explicit http_headers_json_reader(const std::string &s) : m_s(s) {}
 
   bool read(http_headers_t &out) {
     skip_ws();
@@ -158,6 +202,47 @@ private:
     return true;
   }
 
+  // Copies one raw UTF-8 sequence starting at m_pos (its lead byte already
+  // known to be 0x80 or above), refusing overlong forms, surrogates, and
+  // anything above U+10FFFF.
+  bool read_utf8_sequence(std::string &out) {
+    auto lead = static_cast<unsigned char>(m_s[m_pos]);
+    size_t len = 0;
+    uint32_t cp = 0;
+    uint32_t min = 0;
+    if (lead >= 0xC2 && lead <= 0xDF) {
+      len = 2;
+      cp = lead & 0x1Fu;
+      min = 0x80;
+    } else if (lead >= 0xE0 && lead <= 0xEF) {
+      len = 3;
+      cp = lead & 0x0Fu;
+      min = 0x800;
+    } else if (lead >= 0xF0 && lead <= 0xF4) {
+      len = 4;
+      cp = lead & 0x07u;
+      min = 0x10000;
+    } else {
+      return false;
+    }
+    if (m_pos + len > m_s.size()) {
+      return false;
+    }
+    for (size_t i = 1; i < len; ++i) {
+      auto c = static_cast<unsigned char>(m_s[m_pos + i]);
+      if ((c & 0xC0) != 0x80) {
+        return false;
+      }
+      cp = (cp << 6) | (c & 0x3Fu);
+    }
+    if (cp < min || cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) {
+      return false;
+    }
+    out.append(m_s, m_pos, len);
+    m_pos += len;
+    return true;
+  }
+
   bool read_string(std::string &out) {
     skip_ws();
     if (m_pos >= m_s.size() || m_s[m_pos] != '"') {
@@ -165,12 +250,23 @@ private:
     }
     ++m_pos;
     while (m_pos < m_s.size()) {
-      char c = m_s[m_pos++];
+      auto c = static_cast<unsigned char>(m_s[m_pos]);
       if (c == '"') {
+        ++m_pos;
         return true;
       }
+      if (c < 0x20) {
+        return false; // raw control characters, NUL included
+      }
+      if (c >= 0x80) {
+        if (!read_utf8_sequence(out)) {
+          return false;
+        }
+        continue;
+      }
+      ++m_pos;
       if (c != '\\') {
-        out += c;
+        out += static_cast<char>(c);
         continue;
       }
       if (m_pos >= m_s.size()) {
@@ -207,16 +303,24 @@ private:
         if (!read_hex4(cp)) {
           return false;
         }
-        if (cp >= 0xD800 && cp <= 0xDBFF && m_pos + 6 <= m_s.size() &&
-            m_s[m_pos] == '\\' && m_s[m_pos + 1] == 'u') {
-          auto save = m_pos;
+        if (cp == 0) {
+          return false; // U+0000 would cut the C string short
+        }
+        if (cp >= 0xDC00 && cp <= 0xDFFF) {
+          return false; // a low surrogate with no high one before it
+        }
+        if (cp >= 0xD800 && cp <= 0xDBFF) {
+          // A high surrogate must be followed at once by a low one.
+          if (m_pos + 2 > m_s.size() || m_s[m_pos] != '\\' ||
+              m_s[m_pos + 1] != 'u') {
+            return false;
+          }
           m_pos += 2;
           uint32_t lo = 0;
-          if (read_hex4(lo) && lo >= 0xDC00 && lo <= 0xDFFF) {
-            cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
-          } else {
-            m_pos = save;
+          if (!read_hex4(lo) || lo < 0xDC00 || lo > 0xDFFF) {
+            return false;
           }
+          cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
         }
         append_utf8(out, cp);
         break;
@@ -228,35 +332,103 @@ private:
     return false;
   }
 
+  bool read_digits() {
+    auto start = m_pos;
+    while (m_pos < m_s.size() && m_s[m_pos] >= '0' && m_s[m_pos] <= '9') {
+      ++m_pos;
+    }
+    return m_pos > start;
+  }
+
+  // RFC 8259 6: -?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?
+  bool read_number(std::string &out) {
+    auto start = m_pos;
+    if (m_pos < m_s.size() && m_s[m_pos] == '-') {
+      ++m_pos;
+    }
+    if (m_pos >= m_s.size()) {
+      return false;
+    }
+    if (m_s[m_pos] == '0') {
+      ++m_pos;
+    } else if (!read_digits()) {
+      return false;
+    }
+    if (m_pos < m_s.size() && m_s[m_pos] == '.') {
+      ++m_pos;
+      if (!read_digits()) {
+        return false;
+      }
+    }
+    if (m_pos < m_s.size() && (m_s[m_pos] == 'e' || m_s[m_pos] == 'E')) {
+      ++m_pos;
+      if (m_pos < m_s.size() && (m_s[m_pos] == '+' || m_s[m_pos] == '-')) {
+        ++m_pos;
+      }
+      if (!read_digits()) {
+        return false;
+      }
+    }
+    out = m_s.substr(start, m_pos - start);
+    return true;
+  }
+
+  bool read_literal(const char *word) {
+    auto start = m_pos;
+    for (const char *p = word; *p; ++p, ++m_pos) {
+      if (m_pos >= m_s.size() || m_s[m_pos] != *p) {
+        m_pos = start;
+        return false;
+      }
+    }
+    return true;
+  }
+
   // A string, or the literal text of a number / true / false. null sets
-  // is_null and yields an empty value.
+  // is_null and yields an empty value. Whatever follows is left to the
+  // caller, which accepts only ',' or the closing bracket, so "trueish" or
+  // "12abc" fail there.
   bool read_value(std::string &out, bool &is_null) {
     is_null = false;
     skip_ws();
     if (m_pos >= m_s.size()) {
       return false;
     }
-    if (m_s[m_pos] == '"') {
+    char c = m_s[m_pos];
+    if (c == '"') {
       return read_string(out);
     }
-    auto start = m_pos;
-    while (m_pos < m_s.size()) {
-      char c = m_s[m_pos];
-      if ((c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') ||
-          (c >= 'A' && c <= 'Z') || c == '-' || c == '+' || c == '.') {
-        ++m_pos;
-      } else {
-        break;
-      }
+    if (c == '-' || (c >= '0' && c <= '9')) {
+      return read_number(out);
     }
-    if (start == m_pos) {
-      return false;
+    if (read_literal("true")) {
+      out = "true";
+      return true;
     }
-    out = m_s.substr(start, m_pos - start);
-    if (out == "null") {
+    if (read_literal("false")) {
+      out = "false";
+      return true;
+    }
+    if (read_literal("null")) {
       out.clear();
       is_null = true;
+      return true;
     }
+    return false;
+  }
+
+  static bool keep_header(http_headers_t &out, std::string &name,
+                          std::string &value, bool is_null) {
+    if (!http_is_valid_header_name(name)) {
+      return false;
+    }
+    if (is_null) {
+      return true; // null drops the header
+    }
+    if (!http_is_valid_header_value(value)) {
+      return false;
+    }
+    out.emplace_back(std::move(name), std::move(value));
     return true;
   }
 
@@ -271,12 +443,9 @@ private:
       std::string name;
       std::string value;
       bool is_null = false;
-      if (!read_string(name) || !consume(':') || !read_value(value, is_null)) {
+      if (!read_string(name) || !consume(':') || !read_value(value, is_null) ||
+          !keep_header(out, name, value, is_null)) {
         return false;
-      }
-      if (!is_null) {
-        out.emplace_back(http_header_sanitize(name),
-                         http_header_sanitize(value));
       }
       if (consume(',')) {
         continue;
@@ -297,12 +466,9 @@ private:
       std::string value;
       bool is_null = false;
       if (!consume('[') || !read_string(name) || !consume(',') ||
-          !read_value(value, is_null) || !consume(']')) {
+          !read_value(value, is_null) || !consume(']') ||
+          !keep_header(out, name, value, is_null)) {
         return false;
-      }
-      if (!is_null) {
-        out.emplace_back(http_header_sanitize(name),
-                         http_header_sanitize(value));
       }
       if (consume(',')) {
         continue;
@@ -316,22 +482,20 @@ private:
 };
 
 // Parses a JSON object {"Name": "value"} or a JSON array of pairs
-// [["Name", "value"], ...]. Names and values have CR and LF removed. Headers
-// with an empty name are dropped. Returns false (and leaves what was read so
-// far in out) for anything else.
+// [["Name", "value"], ...] under the strict rules of
+// http_headers_json_reader. Every name must be an RFC 9110 token and every
+// value free of CR, LF, NUL and other control characters but tab; a header
+// that breaks either rule fails the whole parse, so nothing can be injected.
+// On success out holds the headers; on failure out is left as it was.
 inline bool http_headers_from_json(const std::string &json,
                                    http_headers_t &out) {
+  http_headers_t headers;
   http_headers_json_reader reader{json};
-  auto ok = reader.read(out);
-  http_headers_t kept;
-  kept.reserve(out.size());
-  for (auto &h : out) {
-    if (!h.first.empty()) {
-      kept.push_back(std::move(h));
-    }
+  if (!reader.read(headers)) {
+    return false;
   }
-  out.swap(kept);
-  return ok;
+  out.swap(headers);
+  return true;
 }
 
 inline const char *http_reason_phrase(int status) {

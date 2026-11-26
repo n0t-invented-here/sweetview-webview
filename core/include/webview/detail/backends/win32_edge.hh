@@ -58,12 +58,15 @@
 
 #include <atomic>
 #include <cctype>
+#include <climits>
 #include <cstdint>
 #include <cstdlib>
+#include <deque>
 #include <functional>
 #include <list>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <utility>
 
@@ -89,6 +92,77 @@ namespace webview {
 namespace detail {
 
 using msg_cb_t = std::function<void(const std::string)>;
+
+// Owns one reference to a COM interface and releases it when it goes, so an
+// early return or an exception can never leak it.
+template <typename T> class com_ptr {
+public:
+  com_ptr() noexcept = default;
+  // Adopts a reference the caller already holds.
+  explicit com_ptr(T *p) noexcept : m_p{p} {}
+  com_ptr(const com_ptr &other) noexcept : m_p{other.m_p} {
+    if (m_p) {
+      m_p->AddRef();
+    }
+  }
+  com_ptr(com_ptr &&other) noexcept : m_p{other.m_p} { other.m_p = nullptr; }
+  com_ptr &operator=(com_ptr other) noexcept {
+    std::swap(m_p, other.m_p);
+    return *this;
+  }
+  ~com_ptr() { reset(); }
+
+  // Takes a new reference of its own to p.
+  static com_ptr add_ref(T *p) noexcept {
+    if (p) {
+      p->AddRef();
+    }
+    return com_ptr{p};
+  }
+
+  void reset() noexcept {
+    if (m_p) {
+      auto *p = m_p;
+      m_p = nullptr;
+      p->Release();
+    }
+  }
+  T *get() const noexcept { return m_p; }
+  T *operator->() const noexcept { return m_p; }
+  explicit operator bool() const noexcept { return m_p != nullptr; }
+  // For out-parameters: releases what is held and lends the slot.
+  T **put() noexcept {
+    reset();
+    return &m_p;
+  }
+  void **put_void() noexcept { return reinterpret_cast<void **>(put()); }
+
+private:
+  T *m_p{};
+};
+
+// Owns a wide string WebView2 allocated with CoTaskMemAlloc.
+class cotaskmem_wstr {
+public:
+  cotaskmem_wstr() noexcept = default;
+  explicit cotaskmem_wstr(LPWSTR s) noexcept : m_s{s} {}
+  cotaskmem_wstr(const cotaskmem_wstr &) = delete;
+  cotaskmem_wstr &operator=(const cotaskmem_wstr &) = delete;
+  ~cotaskmem_wstr() { CoTaskMemFree(m_s); }
+
+  LPCWSTR get() const noexcept { return m_s; }
+  LPWSTR *put() noexcept {
+    CoTaskMemFree(m_s);
+    m_s = nullptr;
+    return &m_s;
+  }
+  std::string narrow() const {
+    return m_s ? narrow_string(m_s) : std::string{};
+  }
+
+private:
+  LPWSTR m_s{};
+};
 
 class webview2_com_handler
     : public ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler,
@@ -215,7 +289,12 @@ public:
   Invoke(ICoreWebView2 * /*sender*/,
          ICoreWebView2WebResourceRequestedEventArgs *args) {
     if (m_resource_requested_cb) {
-      m_resource_requested_cb(args);
+      try {
+        m_resource_requested_cb(args);
+      } catch (...) {
+        // The callback answers every failure itself; nothing may unwind
+        // into WebView2.
+      }
     }
     return S_OK;
   }
@@ -356,6 +435,8 @@ public:
   }
 
   virtual ~win32_edge_engine() {
+    // Answers queued by webview_complete_request do nothing from here on.
+    mark_destroying();
     if (m_com_handler) {
       // No more requests reach this engine; answer the ones still open so
       // their deferrals and event args are released.
@@ -406,8 +487,9 @@ public:
     if (m_message_window) {
       SetWindowLongPtrW(m_message_window, GWLP_WNDPROC, wndproc);
       DestroyWindow(m_message_window);
-      m_message_window = nullptr;
     }
+    // Work still queued never runs; it is destroyed here, not leaked.
+    close_dispatch_queue();
   }
 
   win32_edge_engine(const win32_edge_engine &other) = delete;
@@ -446,9 +528,49 @@ protected:
     PostQuitMessage(0);
     return {};
   }
+  // Queues f and posts one WM_APP per entry; the message window runs the
+  // oldest entry for each WM_APP. The queue owns every entry, so nothing
+  // leaks when a post fails or the window goes before the message arrives.
   noresult dispatch_impl(dispatch_fn_t f) override {
-    PostMessageW(m_message_window, WM_APP, 0, (LPARAM) new dispatch_fn_t(f));
+    std::lock_guard<std::mutex> lock{m_dispatch_mutex};
+    if (!m_message_window) {
+      return error_info{WEBVIEW_ERROR_INVALID_STATE,
+                        "the message window is gone"};
+    }
+    m_dispatch_queue.push_back(std::move(f));
+    if (!PostMessageW(m_message_window, WM_APP, 0, 0)) {
+      // Still under the lock, so the entry just pushed is the last one.
+      m_dispatch_queue.pop_back();
+      return error_info{WEBVIEW_ERROR_UNSPECIFIED, "PostMessageW failed"};
+    }
     return {};
+  }
+
+  // Runs the oldest queued entry, outside the lock so it may queue more.
+  void run_next_dispatched() {
+    dispatch_fn_t f;
+    {
+      std::lock_guard<std::mutex> lock{m_dispatch_mutex};
+      if (m_dispatch_queue.empty()) {
+        return;
+      }
+      f = std::move(m_dispatch_queue.front());
+      m_dispatch_queue.pop_front();
+    }
+    if (f) {
+      f();
+    }
+  }
+
+  // The message window is going: refuse new work and destroy what is queued
+  // (outside the lock, in case an entry's destructor dispatches).
+  void close_dispatch_queue() {
+    std::deque<dispatch_fn_t> dropped;
+    {
+      std::lock_guard<std::mutex> lock{m_dispatch_mutex};
+      m_message_window = nullptr;
+      dropped.swap(m_dispatch_queue);
+    }
   }
 
   noresult set_title_impl(const std::string &title) override {
@@ -510,121 +632,217 @@ protected:
     return {};
   }
 
+  // A request handed to the request handler and not yet answered.
+  struct pending_request_t {
+    com_ptr<ICoreWebView2Deferral> deferral;
+    com_ptr<ICoreWebView2WebResourceRequestedEventArgs> args;
+  };
+
   // Answer requests to http://webview.localhost/<path> from the asset table
   // (see webview_set_asset), and what it misses, plus every request to
   // http://frames.webview.localhost/<path>, from the request handler (see
-  // webview_set_request_handler). Nothing reaches the network.
-  void serve_assets() {
+  // webview_set_request_handler). Nothing reaches the network: every request
+  // the filters match gets a response, a bare 500 when nothing better can be
+  // built. Where the runtime has ICoreWebView2_22 the filters also catch
+  // requests from service workers and shared workers; an older runtime
+  // matches only requests from documents.
+  noresult serve_assets() {
     m_com_handler->set_resource_requested_handler(
         [this](ICoreWebView2WebResourceRequestedEventArgs *args) {
           on_web_resource_requested(args);
         });
-    m_webview->AddWebResourceRequestedFilter(
-        L"http://webview.localhost/*", COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL);
-    m_webview->AddWebResourceRequestedFilter(
-        L"http://frames.webview.localhost/*",
-        COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL);
+    const wchar_t *const filters[] = {L"http://webview.localhost/*",
+                                      L"http://frames.webview.localhost/*"};
+    com_ptr<ICoreWebView2_22> webview22;
+    if (FAILED(m_webview->QueryInterface(__uuidof(ICoreWebView2_22),
+                                         webview22.put_void()))) {
+      webview22.reset();
+    }
+    for (const auto *filter : filters) {
+      HRESULT hr;
+      if (webview22) {
+        hr = webview22->AddWebResourceRequestedFilterWithRequestSourceKinds(
+            filter, COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL,
+            COREWEBVIEW2_WEB_RESOURCE_REQUEST_SOURCE_KINDS_ALL);
+      } else {
+        hr = m_webview->AddWebResourceRequestedFilter(
+            filter, COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL);
+      }
+      if (FAILED(hr)) {
+        return error_info{WEBVIEW_ERROR_UNSPECIFIED,
+                          "AddWebResourceRequestedFilter failed"};
+      }
+    }
     ::EventRegistrationToken token;
-    m_webview->add_WebResourceRequested(m_com_handler, &token);
+    if (FAILED(m_webview->add_WebResourceRequested(m_com_handler, &token))) {
+      return error_info{WEBVIEW_ERROR_UNSPECIFIED,
+                        "add_WebResourceRequested failed"};
+    }
+    return {};
   }
 
   // Narrows a string WebView2 allocated, and frees it.
   static std::string take_co_string(LPWSTR s) {
-    std::string out = s ? narrow_string(s) : std::string{};
-    CoTaskMemFree(s);
-    return out;
+    cotaskmem_wstr owned{s};
+    return owned.narrow();
   }
 
-  static std::string read_request_body(ICoreWebView2WebResourceRequest *req) {
-    std::string out;
-    IStream *content = nullptr;
-    if (FAILED(req->get_Content(&content)) || !content) {
-      return out;
+  // Reads the whole request body into out. False when the stream fails, so
+  // the handler never sees a body cut short.
+  static bool read_request_body(ICoreWebView2WebResourceRequest *req,
+                                std::string &out) {
+    com_ptr<IStream> content;
+    if (FAILED(req->get_Content(content.put()))) {
+      return false;
+    }
+    if (!content) {
+      return true; // no body
     }
     LARGE_INTEGER zero{};
-    content->Seek(zero, STREAM_SEEK_SET, nullptr);
+    auto hr = content->Seek(zero, STREAM_SEEK_SET, nullptr);
+    // A stream that cannot seek is read from where it stands.
+    if (FAILED(hr) && hr != E_NOTIMPL && hr != STG_E_INVALIDFUNCTION) {
+      return false;
+    }
     char buf[16384];
     for (;;) {
       ULONG read = 0;
-      auto hr = content->Read(buf, static_cast<ULONG>(sizeof(buf)), &read);
+      hr = content->Read(buf, static_cast<ULONG>(sizeof(buf)), &read);
+      if (FAILED(hr)) {
+        return false;
+      }
       if (read > 0) {
         out.append(buf, read);
       }
-      if (FAILED(hr) || hr == S_FALSE || read == 0) {
-        break;
+      if (hr == S_FALSE || read == 0) {
+        return true;
       }
     }
-    content->Release();
-    return out;
   }
 
   static std::string
   read_request_headers_json(ICoreWebView2WebResourceRequest *req) {
     http_headers_t headers;
-    ICoreWebView2HttpRequestHeaders *collection = nullptr;
-    if (SUCCEEDED(req->get_Headers(&collection)) && collection) {
-      ICoreWebView2HttpHeadersCollectionIterator *it = nullptr;
-      if (SUCCEEDED(collection->GetIterator(&it)) && it) {
+    com_ptr<ICoreWebView2HttpRequestHeaders> collection;
+    if (SUCCEEDED(req->get_Headers(collection.put())) && collection) {
+      com_ptr<ICoreWebView2HttpHeadersCollectionIterator> it;
+      if (SUCCEEDED(collection->GetIterator(it.put())) && it) {
         BOOL has = FALSE;
-        it->get_HasCurrentHeader(&has);
+        if (FAILED(it->get_HasCurrentHeader(&has))) {
+          has = FALSE;
+        }
         while (has) {
-          LPWSTR name = nullptr;
-          LPWSTR value = nullptr;
-          if (SUCCEEDED(it->GetCurrentHeader(&name, &value))) {
-            auto n = take_co_string(name);
-            auto v = take_co_string(value);
-            headers.emplace_back(std::move(n), std::move(v));
+          cotaskmem_wstr name;
+          cotaskmem_wstr value;
+          if (SUCCEEDED(it->GetCurrentHeader(name.put(), value.put()))) {
+            headers.emplace_back(name.narrow(), value.narrow());
           }
           if (FAILED(it->MoveNext(&has))) {
             break;
           }
         }
-        it->Release();
       }
-      collection->Release();
     }
     return http_headers_to_json(headers);
   }
 
-  // Sets the response on the event args; an empty body sends no stream.
-  void put_response(ICoreWebView2WebResourceRequestedEventArgs *args,
-                    int status, const std::wstring &headers,
-                    const std::string &body) {
+  // A bare "500 Internal Server Error" with no body: the answer of last
+  // resort, so a request never goes on to the network.
+  HRESULT put_fail_closed_response(
+      ICoreWebView2WebResourceRequestedEventArgs *args) noexcept {
     auto *env = m_com_handler ? m_com_handler->environment() : nullptr;
     if (!env || !args) {
-      return;
+      return E_POINTER;
     }
-    IStream *stream = nullptr;
+    com_ptr<ICoreWebView2WebResourceResponse> response;
+    auto hr = env->CreateWebResourceResponse(
+        nullptr, 500, L"Internal Server Error", L"Content-Type: text/plain",
+        response.put());
+    if (FAILED(hr)) {
+      return hr;
+    }
+    if (!response) {
+      return E_FAIL;
+    }
+    return args->put_Response(response.get());
+  }
+
+  HRESULT try_put_response(ICoreWebView2WebResourceRequestedEventArgs *args,
+                           int status, const std::wstring &headers,
+                           const std::string &body) {
+    auto *env = m_com_handler ? m_com_handler->environment() : nullptr;
+    if (!env || !args) {
+      return E_POINTER;
+    }
+    com_ptr<IStream> stream;
     if (!body.empty()) {
-      stream = SHCreateMemStream(reinterpret_cast<const BYTE *>(body.data()),
-                                 static_cast<UINT>(body.size()));
+      if (body.size() > static_cast<size_t>(UINT_MAX)) {
+        return E_INVALIDARG; // SHCreateMemStream takes a UINT length
+      }
+      stream = com_ptr<IStream>{
+          SHCreateMemStream(reinterpret_cast<const BYTE *>(body.data()),
+                            static_cast<UINT>(body.size()))};
+      if (!stream) {
+        return E_OUTOFMEMORY;
+      }
     }
-    ICoreWebView2WebResourceResponse *response = nullptr;
-    env->CreateWebResourceResponse(
-        stream, status, widen_string(http_reason_phrase(status)).c_str(),
-        headers.c_str(), &response);
-    if (stream) {
-      stream->Release();
+    auto reason = widen_string(http_reason_phrase(status));
+    com_ptr<ICoreWebView2WebResourceResponse> response;
+    auto hr = env->CreateWebResourceResponse(
+        stream.get(), status, reason.c_str(), headers.c_str(), response.put());
+    if (FAILED(hr)) {
+      return hr;
     }
-    if (response) {
-      args->put_Response(response);
-      response->Release();
+    if (!response) {
+      return E_FAIL;
+    }
+    return args->put_Response(response.get());
+  }
+
+  // Sets the response on the event args; an empty body sends no stream. When
+  // the response cannot be built (headers WebView2 refuses, no memory for
+  // the body stream) a bare 500 is set instead, never nothing.
+  void put_response(ICoreWebView2WebResourceRequestedEventArgs *args,
+                    int status, const std::wstring &headers,
+                    const std::string &body) noexcept {
+    HRESULT hr = E_FAIL;
+    try {
+      hr = try_put_response(args, status, headers, body);
+    } catch (...) {
+      hr = E_FAIL;
+    }
+    if (FAILED(hr)) {
+      put_fail_closed_response(args);
     }
   }
 
   void on_web_resource_requested(
+      ICoreWebView2WebResourceRequestedEventArgs *args) noexcept {
+    if (!args) {
+      return;
+    }
+    try {
+      handle_web_resource_request(args);
+    } catch (...) {
+      // Anything that went wrong before the request was handed off: answer
+      // it here rather than let it reach the network.
+      put_fail_closed_response(args);
+    }
+  }
+
+  void handle_web_resource_request(
       ICoreWebView2WebResourceRequestedEventArgs *args) {
-    auto *env = m_com_handler->environment();
-    if (!env) {
+    com_ptr<ICoreWebView2WebResourceRequest> request;
+    if (FAILED(args->get_Request(request.put())) || !request) {
+      put_fail_closed_response(args);
       return;
     }
-    ICoreWebView2WebResourceRequest *request = nullptr;
-    if (FAILED(args->get_Request(&request)) || !request) {
+    cotaskmem_wstr uri;
+    if (FAILED(request->get_Uri(uri.put())) || !uri.get()) {
+      put_fail_closed_response(args);
       return;
     }
-    LPWSTR uri = nullptr;
-    request->get_Uri(&uri);
-    std::string url = take_co_string(uri);
+    std::string url = uri.narrow();
 
     // The path is everything from the first '/' after "scheme://host".
     auto path_start = url.find("://");
@@ -641,7 +859,6 @@ protected:
     // The asset table answers the main origin first, at no extra cost.
     if (!is_frames_origin && path_start != std::string::npos) {
       if (auto *asset = find_asset(url.substr(path_start))) {
-        request->Release();
         put_response(args, 200, widen_string("Content-Type: " + asset->mime),
                      asset->data);
         return;
@@ -650,33 +867,75 @@ protected:
 
     auto handler = request_handler();
     if (!handler) {
-      request->Release();
       put_response(args, 404, L"", std::string{});
       return;
     }
 
     std::string method = "GET";
-    LPWSTR wmethod = nullptr;
-    if (SUCCEEDED(request->get_Method(&wmethod)) && wmethod) {
-      method = take_co_string(wmethod);
+    cotaskmem_wstr wmethod;
+    if (SUCCEEDED(request->get_Method(wmethod.put())) && wmethod.get()) {
+      method = wmethod.narrow();
     }
-    auto headers_json = read_request_headers_json(request);
-    auto body = read_request_body(request);
-    request->Release();
+    auto headers_json = read_request_headers_json(request.get());
+    std::string body;
+    if (!read_request_body(request.get(), body)) {
+      // A partial body must not reach the handler as if it were whole.
+      put_response(args, 500, L"Content-Type: text/plain", std::string{});
+      return;
+    }
+    request.reset();
 
     // Hold the request open until webview_complete_request answers it.
-    ICoreWebView2Deferral *deferral = nullptr;
-    if (FAILED(args->GetDeferral(&deferral)) || !deferral) {
+    com_ptr<ICoreWebView2Deferral> deferral;
+    if (FAILED(args->GetDeferral(deferral.put())) || !deferral) {
       put_response(args, 500, L"", std::string{});
       return;
     }
-    args->AddRef();
     auto request_id = next_request_id();
-    m_pending_requests[request_id] = pending_request_t{deferral, args};
+    try {
+      m_pending_requests.emplace(
+          request_id,
+          pending_request_t{
+              deferral,
+              com_ptr<ICoreWebView2WebResourceRequestedEventArgs>::add_ref(
+                  args)});
+    } catch (...) {
+      put_fail_closed_response(args);
+      deferral->Complete();
+      return;
+    }
 
     handler(request_id, method.c_str(), url.c_str(), headers_json.c_str(),
             body.empty() ? nullptr : body.data(), body.size(),
             request_handler_arg());
+  }
+
+  // Answers the deferred request and completes its deferral, whatever
+  // happens on the way.
+  void finish_pending_request(pending_request_t &pending, int status,
+                              const http_headers_t &headers,
+                              const std::string &body) noexcept {
+    bool built = false;
+    std::wstring header_lines;
+    try {
+      std::string lines;
+      for (const auto &h : headers) {
+        lines += h.first;
+        lines += ": ";
+        lines += h.second;
+        lines += "\r\n";
+      }
+      header_lines = widen_string(lines);
+      built = header_lines.empty() == lines.empty();
+    } catch (...) {
+      built = false;
+    }
+    if (built) {
+      put_response(pending.args.get(), status, header_lines, body);
+    } else {
+      put_fail_closed_response(pending.args.get());
+    }
+    pending.deferral->Complete();
   }
 
   void complete_request_impl(uint64_t request_id, int status,
@@ -686,31 +945,18 @@ protected:
     if (found == m_pending_requests.end()) {
       return; // already answered, or the webview is going away
     }
-    auto pending = found->second;
+    auto pending = std::move(found->second);
     m_pending_requests.erase(found);
-
-    std::string header_lines;
-    for (const auto &h : headers) {
-      header_lines += h.first;
-      header_lines += ": ";
-      header_lines += h.second;
-      header_lines += "\r\n";
-    }
-    put_response(pending.args, status, widen_string(header_lines), body);
-    pending.deferral->Complete();
-    pending.deferral->Release();
-    pending.args->Release();
+    finish_pending_request(pending, status, headers, body);
   }
 
   // Answers every request still open with 503 and releases it.
-  void abort_pending_requests() {
+  void abort_pending_requests() noexcept {
     std::map<uint64_t, pending_request_t> pending_requests;
     pending_requests.swap(m_pending_requests);
     for (auto &entry : pending_requests) {
-      put_response(entry.second.args, 503, L"", std::string{});
-      entry.second.deferral->Complete();
-      entry.second.deferral->Release();
-      entry.second.args->Release();
+      finish_pending_request(entry.second, 503, http_headers_t{},
+                             std::string{});
     }
   }
 
@@ -989,13 +1235,10 @@ private:
 
       switch (msg) {
       case WM_APP:
-        if (auto f = (dispatch_fn_t *)(lp)) {
-          (*f)();
-          delete f;
-        }
+        w->run_next_dispatched();
         break;
       case WM_DESTROY:
-        w->m_message_window = nullptr;
+        w->close_dispatch_queue();
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
         break;
       default:
@@ -1097,7 +1340,10 @@ private:
     add_init_script("function(message) {\n\
   return window.chrome.webview.postMessage(message);\n\
 }");
-    serve_assets();
+    auto served = serve_assets();
+    if (!served.ok()) {
+      return served;
+    }
     apply_allow_external_drop();
     resize_webview();
     m_controller->put_IsVisible(TRUE);
@@ -1201,11 +1447,10 @@ private:
   int m_dpi{};
   bool m_is_window_shown{};
   // Requests handed to the request handler and not yet answered.
-  struct pending_request_t {
-    ICoreWebView2Deferral *deferral;
-    ICoreWebView2WebResourceRequestedEventArgs *args;
-  };
   std::map<uint64_t, pending_request_t> m_pending_requests;
+  // Work queued by dispatch_impl, run in order by the message window.
+  std::mutex m_dispatch_mutex;
+  std::deque<dispatch_fn_t> m_dispatch_queue;
   // -1 until webview_set_allow_external_drop, then 0 or 1.
   int m_allow_external_drop = -1;
 };

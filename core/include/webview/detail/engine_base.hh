@@ -38,8 +38,10 @@
 #include <atomic>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <list>
 #include <map>
+#include <memory>
 #include <string>
 
 namespace webview {
@@ -160,7 +162,9 @@ window.__webview__.onUnbind(" +
   noresult set_asset(const std::string &path, const std::string &mime,
                      const void *data, size_t len) {
     m_assets[normalize_asset_path(path)] =
-        asset_t{mime, std::string(static_cast<const char *>(data), len)};
+        asset_t{mime, data && len > 0
+                          ? std::string(static_cast<const char *>(data), len)
+                          : std::string{}};
     return {};
   }
 
@@ -187,23 +191,58 @@ window.__webview__.onUnbind(" +
     return {};
   }
 
-  // Copies the answer and hands it to the UI thread, so it may be called from
-  // any thread and the caller's buffers need not outlive the call.
+  // Validates and copies the answer, then hands it to the UI thread, so it
+  // may be called from any thread and the caller's buffers need not outlive
+  // the call. Invalid headers are refused here, before anything is queued.
+  // The queued completion holds the alive token rather than trusting `this`:
+  // if the engine is destroyed before it runs, it does nothing.
   noresult complete_request(uint64_t request_id, int status,
                             const char *headers_json, const void *body,
                             size_t body_len) {
+    if (!is_alive()) {
+      return error_info{WEBVIEW_ERROR_INVALID_STATE,
+                        "the webview is being destroyed"};
+    }
+    if (request_id == 0 || status < 100 || status > 599 ||
+        (!body && body_len > 0)) {
+      return error_info{WEBVIEW_ERROR_INVALID_ARGUMENT};
+    }
+    // The backends hand bodies to APIs that take 32-bit lengths.
+    if (body_len >
+        static_cast<size_t>((std::numeric_limits<std::uint32_t>::max)())) {
+      return error_info{WEBVIEW_ERROR_INVALID_ARGUMENT,
+                        "body_len is larger than 4 GiB - 1"};
+    }
     http_headers_t headers;
     if (headers_json && !http_headers_from_json(headers_json, headers)) {
-      return error_info{WEBVIEW_ERROR_INVALID_ARGUMENT,
-                        "headers_json is not a JSON object or array of pairs"};
+      return error_info{
+          WEBVIEW_ERROR_INVALID_ARGUMENT,
+          "headers_json is not valid strict JSON (an object or "
+          "array of pairs) of valid HTTP header names and values"};
     }
     std::string bytes;
     if (body && body_len > 0) {
       bytes.assign(static_cast<const char *>(body), body_len);
     }
-    return dispatch([this, request_id, status, headers, bytes] {
+    auto alive = m_alive;
+    return dispatch([this, alive, request_id, status, headers, bytes] {
+      if (!alive->load()) {
+        return; // destroyed after this was queued
+      }
       complete_request_impl(request_id, status, headers, bytes);
     });
+  }
+
+  // Marks the engine as going away. From here on complete_request refuses
+  // new answers and answers already queued do nothing when they run. Called
+  // by webview_destroy before the delete, and by each backend's destructor.
+  void mark_destroying() noexcept { m_alive->store(false); }
+
+  bool is_alive() const noexcept { return m_alive->load(); }
+
+  // Shared with queued work that must not touch the engine once it is gone.
+  std::shared_ptr<std::atomic<bool>> alive_token() const noexcept {
+    return m_alive;
   }
 
   noresult set_allow_external_drop(bool allow) {
@@ -410,7 +449,9 @@ protected:
   // Runs the event loop until the currently queued events have been processed.
   void deplete_run_loop_event_queue() {
     bool done{};
-    dispatch([&] { done = true; });
+    if (!dispatch([&] { done = true; }).ok()) {
+      return; // nothing could be queued, so there is nothing to wait for
+    }
     run_event_loop_while([&] { return !done; });
   }
 
@@ -453,6 +494,9 @@ private:
   webview_request_handler_t m_request_handler{};
   void *m_request_handler_arg{};
   uint64_t m_last_request_id{};
+  // False once the engine is being destroyed; see mark_destroying.
+  std::shared_ptr<std::atomic<bool>> m_alive{
+      std::make_shared<std::atomic<bool>>(true)};
   user_script *m_bind_script{};
   std::list<user_script> m_user_scripts;
 
