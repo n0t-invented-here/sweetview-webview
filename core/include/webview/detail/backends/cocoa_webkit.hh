@@ -44,14 +44,18 @@
 
 #include "../../types.hh"
 #include "../engine_base.hh"
+#include "../http_request.hh"
 #include "../platform/darwin/cocoa/cocoa.hh"
 #include "../platform/darwin/objc/objc.hh"
 #include "../platform/darwin/webkit/webkit.hh"
 #include "../user_script.hh"
 
 #include <atomic>
+#include <cctype>
+#include <cstdint>
 #include <functional>
 #include <list>
+#include <map>
 #include <memory>
 #include <string>
 
@@ -102,6 +106,19 @@ public:
 
   virtual ~cocoa_wkwebview_engine() {
     objc::autoreleasepool arp;
+    if (m_url_scheme_handler) {
+      // WebKit may still start or stop tasks on the handler while the
+      // WKWebView winds down; they must not reach this engine.
+      set_associated_webview(m_url_scheme_handler, nullptr);
+      objc::release(m_url_scheme_handler);
+      m_url_scheme_handler = nullptr;
+    }
+    // Tasks still open are only released: WebKit stops them itself when the
+    // WKWebView goes, and answering one it has stopped would throw.
+    for (auto &entry : m_pending_tasks) {
+      objc::release(entry.second);
+    }
+    m_pending_tasks.clear();
     if (m_window) {
       if (m_webview) {
         if (auto ui_delegate{WKWebView_get_UIDelegate(m_webview)}) {
@@ -326,8 +343,10 @@ private:
     return objc::Class_new(cls);
   }
   // Answers webview://localhost/<path> from the asset table (see
-  // webview_set_asset). Registered on the configuration before the WKWebView
-  // exists, as WebKit requires.
+  // webview_set_asset), and what it misses, plus every request to
+  // webview-frames://localhost/<path>, from the request handler (see
+  // webview_set_request_handler). Registered on the configuration before the
+  // WKWebView exists, as WebKit requires.
   id create_url_scheme_handler() {
     objc::autoreleasepool arp;
     constexpr auto class_name = "WebviewWKURLSchemeHandler";
@@ -338,55 +357,205 @@ private:
       class_addProtocol(cls, objc_getProtocol("WKURLSchemeHandler"));
       class_addMethod(cls, objc::selector("webView:startURLSchemeTask:"),
                       (IMP)(+[](id self, SEL, id, id task) {
-                        auto w = get_associated_webview(self);
-                        w->on_url_scheme_task(task);
+                        if (auto w = get_associated_webview(self)) {
+                          w->on_url_scheme_task(task);
+                        }
                       }),
                       "v@:@@");
+      // WebKit stops a task when the page no longer wants it. Answering a
+      // stopped task raises NSInternalInconsistencyException, so it is
+      // forgotten here and webview_complete_request finds nothing to answer.
       class_addMethod(cls, objc::selector("webView:stopURLSchemeTask:"),
-                      (IMP)(+[](id, SEL, id, id) {}), "v@:@@");
+                      (IMP)(+[](id self, SEL, id, id task) {
+                        if (auto w = get_associated_webview(self)) {
+                          w->on_url_scheme_task_stopped(task);
+                        }
+                      }),
+                      "v@:@@");
       objc_registerClassPair(cls);
     }
     auto instance{objc::Class_new(cls)};
     set_associated_webview(instance, this);
     return instance;
   }
-  void on_url_scheme_task(id task) {
+
+  // Answers a task with a complete HTTP-style response.
+  static void respond_to_url_scheme_task(id task, id url, int status,
+                                         const http_headers_t &headers,
+                                         const char *body, size_t body_len) {
     objc::autoreleasepool arp;
-    auto request = objc::msg_send<id>(task, objc::selector("request"));
-    auto url = objc::msg_send<id>(request, objc::selector("URL"));
-    auto path = objc::msg_send<id>(url, objc::selector("path"));
-    auto *asset = find_asset(path ? NSString_get_UTF8String(path) : "");
     // An HTTP-style response, so WebKit reads the Content-Type (parameters
     // and all, "text/html; charset=utf-8") the way it would from a server. A
     // plain NSURLResponse takes a bare MIME type; given one with parameters
     // it shows HTML as text and refuses module scripts.
-    std::string length = std::to_string(asset ? asset->data.size() : 0);
-    id keys[] = {NSString_stringWithUTF8String("Content-Type"),
-                 NSString_stringWithUTF8String("Content-Length")};
-    id values[] = {
-        NSString_stringWithUTF8String(asset ? asset->mime : "text/plain"),
-        NSString_stringWithUTF8String(length)};
-    auto headers = objc::msg_send<id>(
-        objc::get_class("NSDictionary"),
-        objc::selector("dictionaryWithObjects:forKeys:count:"),
-        static_cast<id *>(values), static_cast<id *>(keys),
-        static_cast<NSUInteger>(2));
+    auto dict = objc::msg_send<id>(objc::get_class("NSMutableDictionary"),
+                                   objc::selector("dictionary"));
+    for (const auto &h : headers) {
+      auto key = NSString_stringWithUTF8String(h.first);
+      auto value = NSString_stringWithUTF8String(h.second);
+      if (!key || !value) {
+        continue; // not valid UTF-8
+      }
+      // NSHTTPURLResponse holds one value per name; repeats are joined the
+      // way HTTP allows.
+      auto existing =
+          objc::msg_send<id>(dict, objc::selector("objectForKey:"), key);
+      if (existing) {
+        value = NSString_stringWithUTF8String(
+            std::string(NSString_get_UTF8String(existing)) + ", " + h.second);
+      }
+      objc::msg_send<void>(dict, objc::selector("setObject:forKey:"), value,
+                           key);
+    }
     auto response = objc::autorelease(objc::msg_send<id>(
         objc::msg_send<id>(objc::get_class("NSHTTPURLResponse"),
                            objc::selector("alloc")),
         objc::selector("initWithURL:statusCode:HTTPVersion:headerFields:"),
-        url, static_cast<NSInteger>(asset ? 200 : 404),
-        NSString_stringWithUTF8String("HTTP/1.1"), headers));
+        url, static_cast<NSInteger>(status),
+        NSString_stringWithUTF8String("HTTP/1.1"), dict));
     objc::msg_send<void>(task, objc::selector("didReceiveResponse:"), response);
-    if (asset && !asset->data.empty()) {
+    if (body && body_len > 0) {
       auto data = objc::msg_send<id>(
           objc::get_class("NSData"), objc::selector("dataWithBytes:length:"),
-          static_cast<const void *>(asset->data.data()),
-          static_cast<NSUInteger>(asset->data.size()));
+          static_cast<const void *>(body), static_cast<NSUInteger>(body_len));
       objc::msg_send<void>(task, objc::selector("didReceiveData:"), data);
     }
     objc::msg_send<void>(task, objc::selector("didFinish"));
   }
+
+  static std::string nsstring_to_string(id s) {
+    if (!s) {
+      return {};
+    }
+    auto utf8 = NSString_get_UTF8String(s);
+    return utf8 ? std::string(utf8) : std::string{};
+  }
+
+  void on_url_scheme_task(id task) {
+    objc::autoreleasepool arp;
+    auto request = objc::msg_send<id>(task, objc::selector("request"));
+    auto url = objc::msg_send<id>(request, objc::selector("URL"));
+    auto scheme = nsstring_to_string(
+        objc::msg_send<id>(url, objc::selector("scheme")));
+    for (auto &c : scheme) {
+      c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    bool is_frames_origin = scheme == "webview-frames";
+
+    // The asset table answers the main origin first, at no extra cost.
+    if (!is_frames_origin) {
+      auto path =
+          nsstring_to_string(objc::msg_send<id>(url, objc::selector("path")));
+      if (auto *asset = find_asset(path)) {
+        http_headers_t headers{
+            {"Content-Type", asset->mime},
+            {"Content-Length", std::to_string(asset->data.size())}};
+        respond_to_url_scheme_task(task, url, 200, headers, asset->data.data(),
+                                   asset->data.size());
+        return;
+      }
+    }
+
+    auto handler = request_handler();
+    if (!handler) {
+      http_headers_t headers{{"Content-Type", "text/plain"},
+                             {"Content-Length", "0"}};
+      respond_to_url_scheme_task(task, url, 404, headers, nullptr, 0);
+      return;
+    }
+
+    auto method = nsstring_to_string(
+        objc::msg_send<id>(request, objc::selector("HTTPMethod")));
+    if (method.empty()) {
+      method = "GET";
+    }
+    auto url_string = nsstring_to_string(
+        objc::msg_send<id>(url, objc::selector("absoluteString")));
+
+    http_headers_t request_headers;
+    auto fields =
+        objc::msg_send<id>(request, objc::selector("allHTTPHeaderFields"));
+    if (fields) {
+      auto keys = objc::msg_send<id>(fields, objc::selector("allKeys"));
+      auto count = objc::msg_send<NSUInteger>(keys, objc::selector("count"));
+      for (NSUInteger i = 0; i < count; ++i) {
+        auto key = objc::msg_send<id>(keys, objc::selector("objectAtIndex:"), i);
+        auto value =
+            objc::msg_send<id>(fields, objc::selector("objectForKey:"), key);
+        request_headers.emplace_back(nsstring_to_string(key),
+                                     nsstring_to_string(value));
+      }
+    }
+    auto headers_json = http_headers_to_json(request_headers);
+
+    std::string body;
+    auto body_data = objc::msg_send<id>(request, objc::selector("HTTPBody"));
+    if (body_data) {
+      auto bytes =
+          objc::msg_send<const void *>(body_data, objc::selector("bytes"));
+      auto length =
+          objc::msg_send<NSUInteger>(body_data, objc::selector("length"));
+      if (bytes && length > 0) {
+        body.assign(static_cast<const char *>(bytes),
+                    static_cast<size_t>(length));
+      }
+    } else if (auto stream = objc::msg_send<id>(
+                   request, objc::selector("HTTPBodyStream"))) {
+      // Some bodies arrive only as a stream.
+      objc::msg_send<void>(stream, objc::selector("open"));
+      uint8_t buf[16384];
+      for (;;) {
+        auto read = objc::msg_send<NSInteger>(
+            stream, objc::selector("read:maxLength:"),
+            static_cast<uint8_t *>(buf), static_cast<NSUInteger>(sizeof(buf)));
+        if (read <= 0) {
+          break;
+        }
+        body.append(reinterpret_cast<const char *>(buf),
+                    static_cast<size_t>(read));
+      }
+      objc::msg_send<void>(stream, objc::selector("close"));
+    }
+
+    // Held until webview_complete_request answers it or WebKit stops it.
+    auto request_id = next_request_id();
+    m_pending_tasks[request_id] = objc::retain(task);
+
+    handler(request_id, method.c_str(), url_string.c_str(),
+            headers_json.c_str(), body.empty() ? nullptr : body.data(),
+            body.size(), request_handler_arg());
+  }
+
+  void on_url_scheme_task_stopped(id task) {
+    for (auto it = m_pending_tasks.begin(); it != m_pending_tasks.end(); ++it) {
+      if (it->second == task) {
+        auto stopped = it->second;
+        m_pending_tasks.erase(it);
+        objc::release(stopped);
+        return;
+      }
+    }
+  }
+
+  void complete_request_impl(uint64_t request_id, int status,
+                             const http_headers_t &headers,
+                             const std::string &body) override {
+    auto found = m_pending_tasks.find(request_id);
+    if (found == m_pending_tasks.end()) {
+      return; // already answered, or stopped by WebKit
+    }
+    auto task = found->second;
+    m_pending_tasks.erase(found);
+    {
+      objc::autoreleasepool arp;
+      auto request = objc::msg_send<id>(task, objc::selector("request"));
+      auto url = objc::msg_send<id>(request, objc::selector("URL"));
+      respond_to_url_scheme_task(task, url, status, headers, body.data(),
+                                 body.size());
+    }
+    objc::release(task);
+  }
+
   id create_script_message_handler() {
     objc::autoreleasepool arp;
     constexpr auto class_name = "WebviewWKScriptMessageHandler";
@@ -541,10 +710,12 @@ private:
     m_manager = WKWebViewConfiguration_get_userContentController(config);
 
     auto url_scheme_handler = objc::autorelease(create_url_scheme_handler());
-    objc::msg_send<void>(config,
-                         objc::selector("setURLSchemeHandler:forURLScheme:"),
-                         url_scheme_handler,
-                         NSString_stringWithUTF8String("webview"));
+    m_url_scheme_handler = objc::retain(url_scheme_handler);
+    for (const char *scheme : {"webview", "webview-frames"}) {
+      objc::msg_send<void>(
+          config, objc::selector("setURLSchemeHandler:forURLScheme:"),
+          url_scheme_handler, NSString_stringWithUTF8String(scheme));
+    }
 
     auto preferences = WKWebViewConfiguration_get_preferences(config);
     auto yes_value = NSNumber_numberWithBool(true);
@@ -707,6 +878,10 @@ private:
   id m_webview{};
   id m_manager{};
   bool m_is_window_shown{};
+  id m_url_scheme_handler{};
+  // Tasks handed to the request handler and not yet answered or stopped;
+  // each is retained.
+  std::map<uint64_t, id> m_pending_tasks;
 };
 
 } // namespace cocoa_webkit

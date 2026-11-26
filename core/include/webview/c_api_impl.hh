@@ -207,6 +207,37 @@ WEBVIEW_API webview_error_t webview_set_asset(webview_t w, const char *path,
       [=] { return cast_to_webview(w)->set_asset(path, mime, data, len); });
 }
 
+WEBVIEW_API webview_error_t webview_set_request_handler(
+    webview_t w, webview_request_handler_t fn, void *arg) {
+  using namespace webview::detail;
+  return api_filter(
+      [=] { return cast_to_webview(w)->set_request_handler(fn, arg); });
+}
+
+WEBVIEW_API webview_error_t webview_complete_request(webview_t w,
+                                                     uint64_t request_id,
+                                                     int status,
+                                                     const char *headers_json,
+                                                     const void *body,
+                                                     size_t body_len) {
+  using namespace webview::detail;
+  if (request_id == 0 || status < 100 || status > 599 ||
+      (!body && body_len > 0)) {
+    return WEBVIEW_ERROR_INVALID_ARGUMENT;
+  }
+  return api_filter([=] {
+    return cast_to_webview(w)->complete_request(request_id, status,
+                                                headers_json, body, body_len);
+  });
+}
+
+WEBVIEW_API webview_error_t webview_set_allow_external_drop(webview_t w,
+                                                            int allow) {
+  using namespace webview::detail;
+  return api_filter(
+      [=] { return cast_to_webview(w)->set_allow_external_drop(allow != 0); });
+}
+
 WEBVIEW_API webview_error_t webview_mouse_hook_install(webview_mouse_hook_fn_t fn,
                                                        void *arg) {
   using namespace webview::detail;

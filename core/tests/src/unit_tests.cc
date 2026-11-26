@@ -66,6 +66,64 @@ TEST_CASE("Ensure that JSON escaping works") {
   REQUIRE(json_escape(R"(alert("gotcha"))", false) == expected_gotcha);
 }
 
+TEST_CASE("Request handler: headers to and from JSON") {
+  using webview::detail::http_headers_from_json;
+  using webview::detail::http_headers_t;
+  using webview::detail::http_headers_to_json;
+  using webview::detail::http_reason_phrase;
+
+  // Request headers go out as an array of pairs, escaped.
+  REQUIRE(http_headers_to_json({}) == "[]");
+  REQUIRE(http_headers_to_json({{"X-A", "1"}, {"X-B", "say \"hi\""}}) ==
+          R"([["X-A","1"],["X-B","say \"hi\""]])");
+
+  // An object of name to value.
+  http_headers_t h;
+  REQUIRE(http_headers_from_json(
+      R"({"Content-Type": "text/plain", "X-N": 5, "X-Gone": null})", h));
+  REQUIRE(h.size() == 2);
+  REQUIRE(h[0].first == "Content-Type");
+  REQUIRE(h[0].second == "text/plain");
+  REQUIRE(h[1].first == "X-N");
+  REQUIRE(h[1].second == "5");
+
+  // An array of pairs keeps repeated names.
+  h.clear();
+  REQUIRE(http_headers_from_json(
+      R"([["Set-Cookie","a=1"], ["Set-Cookie","b=2"]])", h));
+  REQUIRE(h.size() == 2);
+  REQUIRE(h[0].second == "a=1");
+  REQUIRE(h[1].second == "b=2");
+
+  // CR and LF never survive, so no header can be injected.
+  h.clear();
+  REQUIRE(http_headers_from_json(
+      R"({"X-Evil": "a\r\nSet-Cookie: pwned=1", "X\nY": "z"})", h));
+  REQUIRE(h.size() == 2);
+  REQUIRE(h[0].second == "aSet-Cookie: pwned=1");
+  REQUIRE(h[1].first == "XY");
+
+  // Unicode escapes decode to UTF-8, surrogate pairs included.
+  h.clear();
+  REQUIRE(http_headers_from_json(R"({"X-U": "é😀"})", h));
+  REQUIRE(h[0].second == "\xc3\xa9\xf0\x9f\x98\x80");
+
+  // Empty input is no headers; anything else is an error.
+  h.clear();
+  REQUIRE(http_headers_from_json("", h));
+  REQUIRE(http_headers_from_json("  {}  ", h));
+  REQUIRE(http_headers_from_json("[]", h));
+  REQUIRE(h.empty());
+  REQUIRE_FALSE(http_headers_from_json("\"text\"", h));
+  REQUIRE_FALSE(http_headers_from_json("{\"a\":", h));
+  REQUIRE_FALSE(http_headers_from_json("[[\"a\"]]", h));
+  REQUIRE_FALSE(http_headers_from_json("{} trailing", h));
+
+  REQUIRE(std::string(http_reason_phrase(200)) == "OK");
+  REQUIRE(std::string(http_reason_phrase(404)) == "Not Found");
+  REQUIRE(std::string(http_reason_phrase(299)) == "OK");
+}
+
 TEST_CASE("optional class") {
   using namespace webview::detail;
 

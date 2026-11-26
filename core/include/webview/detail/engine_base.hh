@@ -31,10 +31,12 @@
 #include "../errors.hh"
 #include "../types.h"
 #include "../types.hh"
+#include "http_request.hh"
 #include "json.hh"
 #include "user_script.hh"
 
 #include <atomic>
+#include <cstdint>
 #include <functional>
 #include <list>
 #include <map>
@@ -177,6 +179,37 @@ window.__webview__.onUnbind(" +
     return path.substr(start, end == std::string::npos ? end : end - start);
   }
 
+  // Requests the asset table cannot answer go to this handler (see
+  // webview_set_request_handler). Read on the UI thread by the backends.
+  noresult set_request_handler(webview_request_handler_t fn, void *arg) {
+    m_request_handler = fn;
+    m_request_handler_arg = fn ? arg : nullptr;
+    return {};
+  }
+
+  // Copies the answer and hands it to the UI thread, so it may be called from
+  // any thread and the caller's buffers need not outlive the call.
+  noresult complete_request(uint64_t request_id, int status,
+                            const char *headers_json, const void *body,
+                            size_t body_len) {
+    http_headers_t headers;
+    if (headers_json && !http_headers_from_json(headers_json, headers)) {
+      return error_info{WEBVIEW_ERROR_INVALID_ARGUMENT,
+                        "headers_json is not a JSON object or array of pairs"};
+    }
+    std::string bytes;
+    if (body && body_len > 0) {
+      bytes.assign(static_cast<const char *>(body), body_len);
+    }
+    return dispatch([this, request_id, status, headers, bytes] {
+      complete_request_impl(request_id, status, headers, bytes);
+    });
+  }
+
+  noresult set_allow_external_drop(bool allow) {
+    return set_allow_external_drop_impl(allow);
+  }
+
   noresult init(const std::string &js) {
     add_user_script(js);
     return {};
@@ -202,6 +235,20 @@ protected:
                                              int /*a*/) {
     return {};
   }
+  // Runs on the UI thread. Backends that serve no requests have none open.
+  virtual void complete_request_impl(uint64_t /*request_id*/, int /*status*/,
+                                     const http_headers_t & /*headers*/,
+                                     const std::string & /*body*/) {}
+  // Backends without external drag-and-drop control accept and ignore it.
+  virtual noresult set_allow_external_drop_impl(bool /*allow*/) { return {}; }
+
+  webview_request_handler_t request_handler() const {
+    return m_request_handler;
+  }
+  void *request_handler_arg() const { return m_request_handler_arg; }
+
+  // Request ids handed to the request handler: never 0, never reused.
+  uint64_t next_request_id() { return ++m_last_request_id; }
 
   virtual user_script *add_user_script(const std::string &js) {
     return std::addressof(*m_user_scripts.emplace(m_user_scripts.end(),
@@ -403,6 +450,9 @@ private:
 
   std::map<std::string, binding_ctx_t> bindings;
   std::map<std::string, asset_t> m_assets;
+  webview_request_handler_t m_request_handler{};
+  void *m_request_handler_arg{};
+  uint64_t m_last_request_id{};
   user_script *m_bind_script{};
   std::list<user_script> m_user_scripts;
 

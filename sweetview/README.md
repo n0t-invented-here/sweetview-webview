@@ -5,13 +5,15 @@ A fork of [webview](https://github.com/webview/webview) for the sweetview projec
 What the fork adds is documented here, one page per addition. Upstream's files are as upstream has
 them; the only edit outside this folder is the pointer at the top of the root README.
 
-| Addition                                                                            | C API                                                                                                                                                           |
-| ----------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| [Background color](background-color.md): a color, or transparency, behind the page | `webview_set_background_color`                                                                                                                                  |
-| [Assets](assets.md): serve bytes at the webview's own origin                        | `webview_set_asset`                                                                                                                                             |
-| [Mouse hook](mouse-hook.md): every mouse event on the system, swallow any           | `webview_mouse_hook_install`, `webview_mouse_hook_remove`                                                                                                       |
-| [Keyboard hook](keyboard-hook.md): every key event on the system, swallow any       | `webview_keyboard_hook_install`, `webview_keyboard_hook_remove`                                                                                                 |
-| [Permissions](permissions.md): what the hooks need from the OS, and who asks        | `webview_feature_permissions`, `webview_permission_status`, `webview_permission_request`, `webview_permission_set_auto_request`                                 |
+| Addition                                                                                     | C API                                                                                                                           |
+| -------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| [Background color](background-color.md): a color, or transparency, behind the page           | `webview_set_background_color`                                                                                                  |
+| [Assets](assets.md): serve bytes at the webview's own origin                                 | `webview_set_asset`                                                                                                             |
+| [Request handler](request-handler.md): answer requests in code; a cross-origin frames origin | `webview_set_request_handler`, `webview_complete_request`                                                                       |
+| [External drop](external-drop.md): refuse drops from outside the app                         | `webview_set_allow_external_drop`                                                                                               |
+| [Mouse hook](mouse-hook.md): every mouse event on the system, swallow any                    | `webview_mouse_hook_install`, `webview_mouse_hook_remove`                                                                       |
+| [Keyboard hook](keyboard-hook.md): every key event on the system, swallow any                | `webview_keyboard_hook_install`, `webview_keyboard_hook_remove`                                                                 |
+| [Permissions](permissions.md): what the hooks need from the OS, and who asks                 | `webview_feature_permissions`, `webview_permission_status`, `webview_permission_request`, `webview_permission_set_auto_request` |
 
 Where things are:
 
@@ -25,4 +27,4 @@ Where things are:
 - Unit tests: [`unit_tests.cc`](../core/tests/src/unit_tests.cc).
 - Build: upstream's CMake build, unchanged.
 - Bindings: [sweetview-webview-bun](https://github.com/n0t-invented-here/sweetview-webview-bun) builds
-  and ships this library and wraps all five additions in TypeScript.
+  and ships this library and wraps all of these additions in TypeScript.

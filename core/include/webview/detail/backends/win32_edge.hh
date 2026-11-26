@@ -44,6 +44,7 @@
 #include "../../errors.hh"
 #include "../../types.hh"
 #include "../engine_base.hh"
+#include "../http_request.hh"
 #include "../native_library.hh"
 #include "../platform/windows/com_init_wrapper.hh"
 #include "../platform/windows/dpi.hh"
@@ -56,10 +57,14 @@
 #include "../utility/string.hh"
 
 #include <atomic>
+#include <cctype>
+#include <cstdint>
 #include <cstdlib>
 #include <functional>
 #include <list>
+#include <map>
 #include <memory>
+#include <string>
 #include <utility>
 
 #ifndef WIN32_LEAN_AND_MEAN
@@ -352,6 +357,12 @@ public:
 
   virtual ~win32_edge_engine() {
     if (m_com_handler) {
+      // No more requests reach this engine; answer the ones still open so
+      // their deferrals and event args are released.
+      m_com_handler->set_resource_requested_handler(nullptr);
+    }
+    abort_pending_requests();
+    if (m_com_handler) {
       m_com_handler->Release();
       m_com_handler = nullptr;
     }
@@ -471,8 +482,38 @@ protected:
     return {};
   }
 
+  noresult set_allow_external_drop_impl(bool allow) override {
+    m_allow_external_drop = allow ? 1 : 0;
+    // Before the controller exists the value is applied by embed().
+    return apply_allow_external_drop();
+  }
+
+  noresult apply_allow_external_drop() {
+    if (m_allow_external_drop < 0 || !m_controller) {
+      return {};
+    }
+    ICoreWebView2Controller4 *controller4 = nullptr;
+    auto hr = m_controller->QueryInterface(
+        __uuidof(ICoreWebView2Controller4),
+        reinterpret_cast<void **>(&controller4));
+    if (FAILED(hr) || !controller4) {
+      return error_info{WEBVIEW_ERROR_UNSPECIFIED,
+                        "ICoreWebView2Controller4 is not available"};
+    }
+    hr = controller4->put_AllowExternalDrop(m_allow_external_drop ? TRUE
+                                                                  : FALSE);
+    controller4->Release();
+    if (FAILED(hr)) {
+      return error_info{WEBVIEW_ERROR_UNSPECIFIED,
+                        "put_AllowExternalDrop failed"};
+    }
+    return {};
+  }
+
   // Answer requests to http://webview.localhost/<path> from the asset table
-  // (see webview_set_asset). Nothing reaches the network.
+  // (see webview_set_asset), and what it misses, plus every request to
+  // http://frames.webview.localhost/<path>, from the request handler (see
+  // webview_set_request_handler). Nothing reaches the network.
   void serve_assets() {
     m_com_handler->set_resource_requested_handler(
         [this](ICoreWebView2WebResourceRequestedEventArgs *args) {
@@ -480,8 +521,95 @@ protected:
         });
     m_webview->AddWebResourceRequestedFilter(
         L"http://webview.localhost/*", COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL);
+    m_webview->AddWebResourceRequestedFilter(
+        L"http://frames.webview.localhost/*",
+        COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL);
     ::EventRegistrationToken token;
     m_webview->add_WebResourceRequested(m_com_handler, &token);
+  }
+
+  // Narrows a string WebView2 allocated, and frees it.
+  static std::string take_co_string(LPWSTR s) {
+    std::string out = s ? narrow_string(s) : std::string{};
+    CoTaskMemFree(s);
+    return out;
+  }
+
+  static std::string read_request_body(ICoreWebView2WebResourceRequest *req) {
+    std::string out;
+    IStream *content = nullptr;
+    if (FAILED(req->get_Content(&content)) || !content) {
+      return out;
+    }
+    LARGE_INTEGER zero{};
+    content->Seek(zero, STREAM_SEEK_SET, nullptr);
+    char buf[16384];
+    for (;;) {
+      ULONG read = 0;
+      auto hr = content->Read(buf, static_cast<ULONG>(sizeof(buf)), &read);
+      if (read > 0) {
+        out.append(buf, read);
+      }
+      if (FAILED(hr) || hr == S_FALSE || read == 0) {
+        break;
+      }
+    }
+    content->Release();
+    return out;
+  }
+
+  static std::string
+  read_request_headers_json(ICoreWebView2WebResourceRequest *req) {
+    http_headers_t headers;
+    ICoreWebView2HttpRequestHeaders *collection = nullptr;
+    if (SUCCEEDED(req->get_Headers(&collection)) && collection) {
+      ICoreWebView2HttpHeadersCollectionIterator *it = nullptr;
+      if (SUCCEEDED(collection->GetIterator(&it)) && it) {
+        BOOL has = FALSE;
+        it->get_HasCurrentHeader(&has);
+        while (has) {
+          LPWSTR name = nullptr;
+          LPWSTR value = nullptr;
+          if (SUCCEEDED(it->GetCurrentHeader(&name, &value))) {
+            auto n = take_co_string(name);
+            auto v = take_co_string(value);
+            headers.emplace_back(std::move(n), std::move(v));
+          }
+          if (FAILED(it->MoveNext(&has))) {
+            break;
+          }
+        }
+        it->Release();
+      }
+      collection->Release();
+    }
+    return http_headers_to_json(headers);
+  }
+
+  // Sets the response on the event args; an empty body sends no stream.
+  void put_response(ICoreWebView2WebResourceRequestedEventArgs *args,
+                    int status, const std::wstring &headers,
+                    const std::string &body) {
+    auto *env = m_com_handler ? m_com_handler->environment() : nullptr;
+    if (!env || !args) {
+      return;
+    }
+    IStream *stream = nullptr;
+    if (!body.empty()) {
+      stream = SHCreateMemStream(reinterpret_cast<const BYTE *>(body.data()),
+                                 static_cast<UINT>(body.size()));
+    }
+    ICoreWebView2WebResourceResponse *response = nullptr;
+    env->CreateWebResourceResponse(
+        stream, status, widen_string(http_reason_phrase(status)).c_str(),
+        headers.c_str(), &response);
+    if (stream) {
+      stream->Release();
+    }
+    if (response) {
+      args->put_Response(response);
+      response->Release();
+    }
   }
 
   void on_web_resource_requested(
@@ -496,37 +624,93 @@ protected:
     }
     LPWSTR uri = nullptr;
     request->get_Uri(&uri);
-    request->Release();
-    std::string url = uri ? narrow_string(uri) : std::string{};
-    CoTaskMemFree(uri);
+    std::string url = take_co_string(uri);
 
     // The path is everything from the first '/' after "scheme://host".
     auto path_start = url.find("://");
     path_start = path_start == std::string::npos
                      ? std::string::npos
                      : url.find('/', path_start + 3);
-    auto *asset = path_start == std::string::npos
-                      ? nullptr
-                      : find_asset(url.substr(path_start));
+    std::string origin =
+        path_start == std::string::npos ? url : url.substr(0, path_start);
+    for (auto &c : origin) {
+      c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    bool is_frames_origin = origin == "http://frames.webview.localhost";
 
-    ICoreWebView2WebResourceResponse *response = nullptr;
-    if (!asset) {
-      env->CreateWebResourceResponse(nullptr, 404, L"Not Found", L"",
-                                     &response);
-    } else {
-      IStream *stream = SHCreateMemStream(
-          reinterpret_cast<const BYTE *>(asset->data.data()),
-          static_cast<UINT>(asset->data.size()));
-      auto headers = widen_string("Content-Type: " + asset->mime);
-      env->CreateWebResourceResponse(stream, 200, L"OK", headers.c_str(),
-                                     &response);
-      if (stream) {
-        stream->Release();
+    // The asset table answers the main origin first, at no extra cost.
+    if (!is_frames_origin && path_start != std::string::npos) {
+      if (auto *asset = find_asset(url.substr(path_start))) {
+        request->Release();
+        put_response(args, 200, widen_string("Content-Type: " + asset->mime),
+                     asset->data);
+        return;
       }
     }
-    if (response) {
-      args->put_Response(response);
-      response->Release();
+
+    auto handler = request_handler();
+    if (!handler) {
+      request->Release();
+      put_response(args, 404, L"", std::string{});
+      return;
+    }
+
+    std::string method = "GET";
+    LPWSTR wmethod = nullptr;
+    if (SUCCEEDED(request->get_Method(&wmethod)) && wmethod) {
+      method = take_co_string(wmethod);
+    }
+    auto headers_json = read_request_headers_json(request);
+    auto body = read_request_body(request);
+    request->Release();
+
+    // Hold the request open until webview_complete_request answers it.
+    ICoreWebView2Deferral *deferral = nullptr;
+    if (FAILED(args->GetDeferral(&deferral)) || !deferral) {
+      put_response(args, 500, L"", std::string{});
+      return;
+    }
+    args->AddRef();
+    auto request_id = next_request_id();
+    m_pending_requests[request_id] = pending_request_t{deferral, args};
+
+    handler(request_id, method.c_str(), url.c_str(), headers_json.c_str(),
+            body.empty() ? nullptr : body.data(), body.size(),
+            request_handler_arg());
+  }
+
+  void complete_request_impl(uint64_t request_id, int status,
+                             const http_headers_t &headers,
+                             const std::string &body) override {
+    auto found = m_pending_requests.find(request_id);
+    if (found == m_pending_requests.end()) {
+      return; // already answered, or the webview is going away
+    }
+    auto pending = found->second;
+    m_pending_requests.erase(found);
+
+    std::string header_lines;
+    for (const auto &h : headers) {
+      header_lines += h.first;
+      header_lines += ": ";
+      header_lines += h.second;
+      header_lines += "\r\n";
+    }
+    put_response(pending.args, status, widen_string(header_lines), body);
+    pending.deferral->Complete();
+    pending.deferral->Release();
+    pending.args->Release();
+  }
+
+  // Answers every request still open with 503 and releases it.
+  void abort_pending_requests() {
+    std::map<uint64_t, pending_request_t> pending_requests;
+    pending_requests.swap(m_pending_requests);
+    for (auto &entry : pending_requests) {
+      put_response(entry.second.args, 503, L"", std::string{});
+      entry.second.deferral->Complete();
+      entry.second.deferral->Release();
+      entry.second.args->Release();
     }
   }
 
@@ -914,6 +1098,7 @@ private:
   return window.chrome.webview.postMessage(message);\n\
 }");
     serve_assets();
+    apply_allow_external_drop();
     resize_webview();
     m_controller->put_IsVisible(TRUE);
     ShowWindow(m_widget, SW_SHOW);
@@ -1015,6 +1200,14 @@ private:
   mswebview2::loader m_webview2_loader;
   int m_dpi{};
   bool m_is_window_shown{};
+  // Requests handed to the request handler and not yet answered.
+  struct pending_request_t {
+    ICoreWebView2Deferral *deferral;
+    ICoreWebView2WebResourceRequestedEventArgs *args;
+  };
+  std::map<uint64_t, pending_request_t> m_pending_requests;
+  // -1 until webview_set_allow_external_drop, then 0 or 1.
+  int m_allow_external_drop = -1;
 };
 
 } // namespace detail

@@ -202,6 +202,81 @@ WEBVIEW_API webview_error_t webview_set_asset(webview_t w, const char *path,
                                               const void *data, size_t len);
 
 /**
+ * Answers requests to the webview's origins in code instead of from fixed
+ * bytes. Nothing reaches the network and no socket is opened.
+ *
+ * Two origins go to the handler:
+ * - The main origin of webview_set_asset (Windows: http://webview.localhost,
+ *   macOS: webview://localhost), for any path with no asset; an asset still
+ *   answers first.
+ * - A second origin for content that must be cross-origin from the page, for
+ *   example a sandboxed iframe (Windows: http://frames.webview.localhost,
+ *   macOS: webview-frames://localhost). Every request to it goes to the
+ *   handler.
+ *
+ * Without a handler both answer 404 for anything with no asset. Passing
+ * @p fn NULL removes the handler; requests already handed to it stay open
+ * until completed or until the webview is destroyed, which answers them 503.
+ *
+ * @p fn runs on the UI thread. It must not block: it hands the request off and
+ * returns, and the answer goes back with webview_complete_request.
+ *
+ * Remarks:
+ * - Windows: WebView2's WebResourceRequested event, deferred
+ *   (ICoreWebView2Deferral) until the request is completed.
+ * - macOS: a WKURLSchemeHandler for the schemes "webview" and
+ *   "webview-frames". A task WebKit stops before it is completed is dropped,
+ *   and completing it later does nothing.
+ * - Linux: accepted and stored; not served.
+ *
+ * @param w The webview instance.
+ * @param fn The handler, or NULL to remove it.
+ * @param arg Passed to @p fn as is.
+ */
+WEBVIEW_API webview_error_t webview_set_request_handler(
+    webview_t w, webview_request_handler_t fn, void *arg);
+
+/**
+ * Answers a request handed to the request handler (see
+ * webview_set_request_handler). Safe to call from any thread; the response is
+ * delivered on the UI thread. The headers and body are copied before this
+ * returns. Completing a request twice, or one the browser has since
+ * cancelled, does nothing.
+ *
+ * @param w The webview instance.
+ * @param request_id The @c request_id the handler received.
+ * @param status HTTP status code, 100-599.
+ * @param headers_json Response headers, as a JSON object of name to value
+ *                     ({"Content-Type": "text/html"}) or a JSON array of
+ *                     [name, value] pairs, which allows a name to repeat
+ *                     ([["Set-Cookie","a=1"],["Set-Cookie","b=2"]]). CR and
+ *                     LF are removed from names and values. NULL or "" for
+ *                     none.
+ * @param body The response body, or NULL when @p body_len is 0.
+ * @param body_len Length of @p body in bytes.
+ */
+WEBVIEW_API webview_error_t webview_complete_request(webview_t w,
+                                                     uint64_t request_id,
+                                                     int status,
+                                                     const char *headers_json,
+                                                     const void *body,
+                                                     size_t body_len);
+
+/**
+ * Sets whether files and other content dragged from outside the app can be
+ * dropped on the page. Allowed by default.
+ *
+ * Remarks:
+ * - Windows: ICoreWebView2Controller4::AllowExternalDrop.
+ * - macOS, Linux: accepted; does nothing.
+ *
+ * @param w The webview instance.
+ * @param allow Non-zero to allow, 0 to refuse.
+ */
+WEBVIEW_API webview_error_t webview_set_allow_external_drop(webview_t w,
+                                                            int allow);
+
+/**
  * Installs a system-wide mouse hook: @p fn sees every mouse event on the
  * system before any window does, and decides per event whether it goes on or
  * is swallowed. This is how a click-through overlay window gets some of the

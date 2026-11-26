@@ -107,7 +107,7 @@ jobs:
       - name: Test (${{ matrix.build-type }}, Windows)
         if: runner.os == 'Windows'
         run: |
-          mswebview2_version=1.0.1150.38
+          mswebview2_version=1.0.1185.39
           mswebview2_zip=$(mktemp)
           mswebview2_dir=$(mktemp -d)
           mswebview2_include_dir="${mswebview2_dir}/build/native/include"

@@ -26,6 +26,9 @@
 #ifndef WEBVIEW_TYPES_H
 #define WEBVIEW_TYPES_H
 
+#include <stddef.h>
+#include <stdint.h>
+
 /// Holds the elements of a MAJOR.MINOR.PATCH version number.
 typedef struct {
   /// Major version.
@@ -182,6 +185,31 @@ typedef enum {
  */
 typedef int (*webview_keyboard_hook_fn_t)(int event, const char *code,
                                           unsigned raw, unsigned modifiers,
+                                          void *arg);
+
+/**
+ * Called for a request the webview's own origins could not answer from the
+ * asset table (see webview_set_request_handler). Runs on the UI thread, from
+ * inside the run loop. Answer it later, from any thread, with
+ * webview_complete_request and the same @p request_id.
+ *
+ * Every pointer argument is valid only for the duration of the call; copy
+ * what is needed afterwards.
+ *
+ * @param request_id Identifies the request to webview_complete_request.
+ *                   Never 0; increases with each request.
+ * @param method The HTTP method, for example "GET" or "POST".
+ * @param url The full URL, for example "http://webview.localhost/api?x=1".
+ * @param headers_json The request headers as a JSON array of
+ *                     [name, value] string pairs.
+ * @param body The request body, or NULL when there is none.
+ * @param body_len Length of @p body in bytes.
+ * @param arg The @p arg passed to webview_set_request_handler.
+ */
+typedef void (*webview_request_handler_t)(uint64_t request_id,
+                                          const char *method, const char *url,
+                                          const char *headers_json,
+                                          const void *body, size_t body_len,
                                           void *arg);
 
 #endif // WEBVIEW_TYPES_H
