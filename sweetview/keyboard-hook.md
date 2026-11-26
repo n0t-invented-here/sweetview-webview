@@ -56,12 +56,14 @@ The tables from Windows scan codes and macOS keycodes to DOM codes are in
 | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Windows  | A low-level keyboard hook (`WH_KEYBOARD_LL`) on the calling thread, which must pump messages; `webview_run` does. Repeat is detected from the hook's own state, since the low-level message carries no repeat count                                                                                                                             |
 | macOS    | Key-down, key-up and flags-changed on the `CGEventTap` the mouse hook uses: one tap, one permission (**Device Control and Data Access**, see [Permissions](permissions.md)), one run-loop source. A modifier key's press and release arrive as flags-changed and are reported as its down and up. Caps Lock reports a down when the lock turns on and an up when it turns off |
-| Linux    | Not supported; fails with `WEBVIEW_ERROR_UNSPECIFIED`                                                                                                                                                                                                                                                                                          |
+| Linux    | Not supported; fails with `WEBVIEW_ERROR_UNSPECIFIED` ([why](README.md#linux))                                                                                                                                                                                                                                                                                          |
 
 ## Errors
 
 | Code                               | When                                                                            |
 | ---------------------------------- | ------------------------------------------------------------------------------- |
+| `WEBVIEW_ERROR_INVALID_ARGUMENT`   | `fn` is `NULL` |
 | `WEBVIEW_ERROR_DUPLICATE`          | A keyboard hook is already installed                                            |
-| `WEBVIEW_ERROR_MISSING_DEPENDENCY` | macOS: the permission is missing (the system was asked, if auto-request is on)  |
+| `WEBVIEW_ERROR_MISSING_DEPENDENCY` | macOS: the event tap could not be created, reported as the permission missing (the system was asked, if auto-request is on) |
+| `WEBVIEW_ERROR_UNSPECIFIED`        | Windows: `SetWindowsHookEx` failed; Linux: not supported |
 | `WEBVIEW_ERROR_NOT_FOUND`          | `webview_keyboard_hook_remove` with no hook installed                           |

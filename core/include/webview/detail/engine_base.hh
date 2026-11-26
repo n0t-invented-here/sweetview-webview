@@ -167,6 +167,18 @@ window.__webview__.onUnbind(" +
 
   noresult set_asset(const std::string &path, const std::string &mime,
                      const void *data, size_t len) {
+    // The MIME type becomes a Content-Type header value, so it is held to
+    // the same rules as any response header value (no CR, LF, NUL or other
+    // control characters). Bodies are capped like streamed chunks: both
+    // WebView2 and WebKit take body sizes as 32-bit lengths on some paths.
+    if (!http_is_valid_header_value(mime)) {
+      return error_info{WEBVIEW_ERROR_INVALID_ARGUMENT,
+                        "mime holds CR, LF, NUL or another control character"};
+    }
+    if (len > static_cast<size_t>((std::numeric_limits<std::uint32_t>::max)())) {
+      return error_info{WEBVIEW_ERROR_INVALID_ARGUMENT,
+                        "data_len is larger than 4 GiB - 1"};
+    }
     m_assets[normalize_asset_path(path)] =
         asset_t{mime, data && len > 0
                           ? std::string(static_cast<const char *>(data), len)
@@ -336,17 +348,39 @@ window.__webview__.onUnbind(" +
 
   // Files dropped from the operating system go to fn (see
   // webview_set_file_drop_handler); NULL hands drops back to the page.
+  // Transactional: when the backend refuses the change, the previous handler
+  // and argument are put back before the error is returned.
   noresult set_file_drop_handler(webview_file_drop_handler_t fn, void *arg) {
+    webview_file_drop_handler_t previous_fn;
+    void *previous_arg;
     {
       std::lock_guard<std::mutex> lock{m_file_drop_mutex};
+      previous_fn = m_file_drop_handler;
+      previous_arg = m_file_drop_handler_arg;
       m_file_drop_handler = fn;
       m_file_drop_handler_arg = fn ? arg : nullptr;
     }
-    return set_file_drop_handler_impl(fn != nullptr);
+    auto restore = [&] {
+      std::lock_guard<std::mutex> lock{m_file_drop_mutex};
+      m_file_drop_handler = previous_fn;
+      m_file_drop_handler_arg = previous_arg;
+    };
+    noresult res;
+    try {
+      res = set_file_drop_handler_impl(fn != nullptr);
+    } catch (...) {
+      restore();
+      throw;
+    }
+    if (!res.ok()) {
+      restore();
+    }
+    return res;
   }
 
-  // True while an answer from webview_complete_request for request_id is
-  // queued and has not run yet.
+  // True while an answer from webview_complete_request, or a streamed head
+  // from webview_begin_response, for request_id is queued and the UI thread
+  // has not taken it yet.
   bool is_request_submitted(uint64_t request_id) const {
     std::lock_guard<std::mutex> lock{m_submitted_mutex};
     // NOLINTNEXTLINE(readability-container-contains): contains() requires C++20
@@ -702,8 +736,8 @@ private:
   // False once the engine is being destroyed; see mark_destroying.
   std::shared_ptr<std::atomic<bool>> m_alive{
       std::make_shared<std::atomic<bool>>(true)};
-  // Request ids answered by complete_request whose answer is still queued;
-  // see is_request_submitted.
+  // Request ids answered by complete_request or begun by begin_response
+  // whose work is still queued for the UI thread; see is_request_submitted.
   mutable std::mutex m_submitted_mutex;
   std::unordered_set<uint64_t> m_submitted_requests;
   user_script *m_bind_script{};

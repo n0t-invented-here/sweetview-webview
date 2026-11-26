@@ -772,9 +772,11 @@ protected:
   // http://frames.webview.localhost/<path>, from the request handler (see
   // webview_set_request_handler). Nothing reaches the network: every request
   // the filters match gets a response, a bare 500 when nothing better can be
-  // built. Where the runtime has ICoreWebView2_22 the filters also catch
-  // requests from service workers and shared workers; an older runtime
-  // matches only requests from documents.
+  // built. Where the runtime has ICoreWebView2_22 (Runtime 122.0.2365.46,
+  // SDK 1.0.2365.46) the filters take every request source kind, so they
+  // also catch requests from service workers, shared workers and
+  // cross-origin iframes; an older runtime falls back to the legacy filter,
+  // which misses those.
   noresult serve_assets() {
     m_com_handler->set_resource_requested_handler(
         [this](ICoreWebView2WebResourceRequestedEventArgs *args) {
@@ -1068,17 +1070,18 @@ protected:
               body.empty() ? nullptr : body.data(), body.size(),
               request_handler_arg());
     } catch (...) {
-      // A handler that throws must not strand the request: if it did not
-      // answer before throwing, answer it here with the fallback 500. The
+      // A handler that throws must not strand the request: if it neither
+      // answered nor began a streamed response before throwing, answer it
+      // here with the fallback 500. The
       // exception goes no further (WebView2 cannot take it).
       fail_pending_request(request_id);
     }
   }
 
   // Answers a still-open request with the fallback 500 and completes it.
-  // A request the handler already answered through webview_complete_request
-  // (queued, not yet run) is left alone so the fallback cannot replace that
-  // answer. When not even the fallback can be set the request stays pending,
+  // A request the handler already answered through webview_complete_request,
+  // or began streaming through webview_begin_response (queued, not yet run),
+  // is left alone so the fallback cannot replace that answer. When not even the fallback can be set the request stays pending,
   // so abort_pending_requests() still releases it at teardown.
   void fail_pending_request(uint64_t request_id) noexcept {
     if (is_request_submitted(request_id)) {
@@ -1344,21 +1347,31 @@ protected:
   // again in each new one. Never blocks and never pumps messages (unlike
   // AddScriptToExecuteOnDocumentCreated), so it is safe to call from inside
   // a file drop handler or any other callback on the UI thread.
+  //
+  // The flag only changes once the script is queued: when ExecuteScript
+  // fails, engine_base puts the previous handler back and the flag still
+  // matches it.
   noresult set_file_drop_handler_impl(bool enabled) override {
     if (enabled == m_file_drop_enabled) {
       return {};
     }
-    m_file_drop_enabled = enabled;
-    if (!m_webview) {
-      return {}; // on_content_loading() applies it to the first document
+    if (m_webview) {
+      auto script = widen_string(file_drop_flag_script(enabled));
+      auto hr = m_webview->ExecuteScript(script.c_str(), nullptr);
+      if (FAILED(hr)) {
+        return error_info{WEBVIEW_ERROR_UNSPECIFIED, "ExecuteScript failed"};
+      }
     }
-    return eval(file_drop_flag_script());
+    // Without a WebView yet, on_content_loading() applies it to the first
+    // document.
+    m_file_drop_enabled = enabled;
+    return {};
   }
 
-  std::string file_drop_flag_script() const {
+  static std::string file_drop_flag_script(bool enabled) {
     return std::string{"if (window === window.top) {"
                        " window.__webview_file_drop_enabled__ = "} +
-           (m_file_drop_enabled ? "true" : "false") + "; }";
+           (enabled ? "true" : "false") + "; }";
   }
 
   // UI thread: a new top-level document is loading. Its drop script starts
@@ -1367,7 +1380,7 @@ protected:
   // the two may run in either order.
   void on_content_loading() {
     if (m_file_drop_enabled && m_webview) {
-      eval(file_drop_flag_script());
+      eval(file_drop_flag_script(true));
     }
   }
 

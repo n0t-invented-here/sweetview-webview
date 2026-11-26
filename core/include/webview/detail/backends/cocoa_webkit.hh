@@ -62,6 +62,7 @@
 #include <string>
 #include <vector>
 
+#include <CoreFoundation/CoreFoundation.h>
 #include <objc/objc-runtime.h>
 
 namespace webview {
@@ -94,6 +95,9 @@ using namespace cocoa;
 using namespace webkit;
 
 class cocoa_wkwebview_engine : public engine_base {
+  // Where one drag session over the WKWebView goes; see get_webview_class.
+  enum class drag_route_t { webkit, file_drop, rejected };
+
 public:
   cocoa_wkwebview_engine(bool debug, void *window)
       : engine_base{!window}, m_app{NSApplication_get_sharedApplication()} {
@@ -126,26 +130,14 @@ public:
     }
     m_pending_tasks.clear();
     m_streaming_tasks.clear();
-    if (m_webview) {
-      // Drags still reaching the WKWebView must not reach this engine.
-      set_associated_webview(m_webview, nullptr);
+    if (m_window && m_widget &&
+        m_widget == NSWindow_get_contentView(m_window)) {
+      NSWindow_set_contentView(m_window, nullptr);
     }
+    // Drags and script messages still reaching the views must not reach this
+    // engine; does nothing when windowWillClose: already did it.
+    detach_and_release_views();
     if (m_window) {
-      if (m_webview) {
-        if (auto ui_delegate{WKWebView_get_UIDelegate(m_webview)}) {
-          WKWebView_set_UIDelegate(m_webview, nullptr);
-          objc::release(ui_delegate);
-        }
-        objc::release(m_webview);
-        m_webview = nullptr;
-      }
-      if (m_widget) {
-        if (m_widget == NSWindow_get_contentView(m_window)) {
-          NSWindow_set_contentView(m_window, nullptr);
-        }
-        objc::release(m_widget);
-        m_widget = nullptr;
-      }
       if (owns_window()) {
         // Replace delegate to avoid callbacks and other bad things during
         // destruction.
@@ -169,8 +161,6 @@ public:
       // Needed for the window to close immediately.
       deplete_run_loop_event_queue();
     }
-    // TODO: Figure out why m_manager is still alive after the autoreleasepool
-    // has been drained.
   }
 
 protected:
@@ -595,8 +585,10 @@ private:
               body.size(), request_handler_arg());
     } catch (...) {
       // A handler that throws must not strand the request: unless it already
-      // submitted an answer through webview_complete_request (queued, not yet
-      // run), answer it here with a bare 500. The exception goes no further.
+      // submitted an answer through webview_complete_request or began one
+      // through webview_begin_response (queued, not yet run), answer it here
+      // with a bare 500. The exception goes no further (it must not unwind
+      // into WebKit).
       if (!is_request_submitted(request_id)) {
         try {
           complete_request_impl(request_id, 500, http_headers_t{},
@@ -698,12 +690,26 @@ private:
     });
   }
 
+  // External drops (see webview_set_allow_external_drop): the WKWebView
+  // subclass checks m_allow_external_drop on every drag.
+  noresult set_allow_external_drop_impl(bool allow) override {
+    m_allow_external_drop.store(allow);
+    return {};
+  }
+
   // File drops (see webview_set_file_drop_handler): the WKWebView subclass
   // asks file_drop_handler() on every drag, so there is nothing to switch.
   noresult set_file_drop_handler_impl(bool /*enabled*/) override { return {}; }
 
-  // A WKWebView that takes drags of files from Finder while a file drop
-  // handler is set, and leaves every other drag to WKWebView.
+  // A WKWebView that refuses external drags when allow_external_drop is false,
+  // takes drags of files from Finder while a file drop handler is set, and
+  // leaves every other drag to WKWebView.
+  //
+  // Each drag session (NSDraggingInfo.draggingSequenceNumber) is routed once,
+  // in draggingEntered:, and every later message of that session follows the
+  // recorded route, so WebKit only ever sees a complete entered / updated /
+  // exited-or-performed sequence for the sessions it was given. Every method
+  // body catches everything: no C++ exception may unwind into AppKit.
   static Class get_webview_class() {
     constexpr auto class_name = "SweetviewWKWebView";
     // Avoid crash due to registering same class twice
@@ -711,44 +717,334 @@ private:
     if (cls) {
       return cls;
     }
-    cls = objc_allocateClassPair(objc::get_class("WKWebView"), class_name, 0);
-    class_addMethod(cls, objc::selector("draggingEntered:"),
-                    (IMP)(+[](id self, SEL sel, id sender) -> NSUInteger {
-                      if (takes_file_drag(self, sender)) {
-                        return 1; // NSDragOperationCopy
-                      }
-                      return call_webview_super<NSUInteger>(self, sel, sender);
-                    }),
-                    "Q@:@");
-    class_addMethod(cls, objc::selector("draggingUpdated:"),
-                    (IMP)(+[](id self, SEL sel, id sender) -> NSUInteger {
-                      if (takes_file_drag(self, sender)) {
-                        return 1; // NSDragOperationCopy
-                      }
-                      return call_webview_super<NSUInteger>(self, sel, sender);
-                    }),
-                    "Q@:@");
-    class_addMethod(cls, objc::selector("prepareForDragOperation:"),
-                    (IMP)(+[](id self, SEL sel, id sender) -> BOOL {
-                      if (takes_file_drag(self, sender)) {
-                        return YES;
-                      }
-                      return call_webview_super<BOOL>(self, sel, sender);
-                    }),
-                    "c@:@");
-    class_addMethod(cls, objc::selector("performDragOperation:"),
-                    (IMP)(+[](id self, SEL sel, id sender) -> BOOL {
-                      if (takes_file_drag(self, sender)) {
-                        if (auto w = get_associated_webview(self)) {
-                          w->deliver_file_drop(dragged_file_paths(sender));
-                        }
-                        return YES;
-                      }
-                      return call_webview_super<BOOL>(self, sel, sender);
-                    }),
-                    "c@:@");
+    auto wk_cls = objc::get_class("WKWebView");
+    cls = objc_allocateClassPair(wk_cls, class_name, 0);
+    auto add_drag_method = [&](const char *name, IMP imp,
+                               const char *fallback_types) {
+      auto sel = objc::selector(name);
+      // Copy WKWebView's own encoding: BOOL is "c" on x86_64 but "B" on
+      // arm64, so a hardcoded encoding is wrong on one of them.
+      const char *types = nullptr;
+      if (auto method = class_getInstanceMethod(wk_cls, sel)) {
+        types = method_getTypeEncoding(method);
+      }
+      class_addMethod(cls, sel, imp, types ? types : fallback_types);
+    };
+#if defined(__arm64__) || defined(__aarch64__)
+    constexpr auto bool_types = "B@:@";
+#else
+    constexpr auto bool_types = "c@:@";
+#endif
+    add_drag_method(
+        "draggingEntered:",
+        (IMP)(+[](id self, SEL sel, id sender) -> NSUInteger {
+          try {
+            auto w = get_associated_webview(self);
+            if (!w) {
+              return call_webview_super<NSUInteger>(self, sel, sender);
+            }
+            auto route = decide_drag_route(self, sender);
+            w->m_drag_routes[drag_sequence(sender)] = route;
+            return drag_operation_for(self, sel, sender, route);
+          } catch (...) {
+            return 0; // NSDragOperationNone
+          }
+        }),
+        "Q@:@");
+    add_drag_method(
+        "draggingUpdated:",
+        (IMP)(+[](id self, SEL sel, id sender) -> NSUInteger {
+          try {
+            auto w = get_associated_webview(self);
+            if (!w) {
+              return call_webview_super<NSUInteger>(self, sel, sender);
+            }
+            auto seq = drag_sequence(sender);
+            auto found = w->m_drag_routes.find(seq);
+            if (found == w->m_drag_routes.end()) {
+              // Unseen session (entered before this engine was attached):
+              // decide now and stick to it.
+              found =
+                  w->m_drag_routes.emplace(seq, decide_drag_route(self, sender))
+                      .first;
+            }
+            switch (found->second) {
+            case drag_route_t::rejected:
+              return 0; // NSDragOperationNone
+            case drag_route_t::file_drop:
+              if (!file_drop_still_allowed(self, sender)) {
+                // Handler cleared, external drops disabled, or copying no
+                // longer allowed (modifier keys) mid-drag.
+                found->second = drag_route_t::rejected;
+                return 0;
+              }
+              return 1; // NSDragOperationCopy
+            case drag_route_t::webkit:
+              if (!w->m_allow_external_drop.load() &&
+                  is_external_drag(sender)) {
+                // External drops disabled mid-drag: let WebKit wind down the
+                // drag it was following, then refuse the rest of it.
+                found->second = drag_route_t::rejected;
+                call_webview_super_exited(self, sender);
+                return 0;
+              }
+              return call_webview_super<NSUInteger>(self, sel, sender);
+            }
+            return 0;
+          } catch (...) {
+            return 0; // NSDragOperationNone
+          }
+        }),
+        "Q@:@");
+    add_drag_method(
+        "draggingExited:",
+        (IMP)(+[](id self, SEL sel, id sender) {
+          try {
+            auto w = get_associated_webview(self);
+            if (!w) {
+              call_webview_super<void>(self, sel, sender);
+              return;
+            }
+            auto route = take_drag_route(w, sender);
+            // Only sessions WebKit was following get the exit; it never saw
+            // rejected or file drop sessions enter.
+            if (route == drag_route_t::webkit) {
+              call_webview_super<void>(self, sel, sender);
+            }
+          } catch (...) {
+          }
+        }),
+        "v@:@");
+    add_drag_method(
+        "prepareForDragOperation:",
+        (IMP)(+[](id self, SEL sel, id sender) -> BOOL {
+          try {
+            auto w = get_associated_webview(self);
+            if (!w) {
+              return call_webview_super<BOOL>(self, sel, sender);
+            }
+            switch (peek_drag_route(self, w, sender)) {
+            case drag_route_t::rejected:
+              return NO;
+            case drag_route_t::file_drop:
+              if (!file_drop_still_allowed(self, sender)) {
+                w->m_drag_routes[drag_sequence(sender)] =
+                    drag_route_t::rejected;
+                return NO;
+              }
+              return YES;
+            case drag_route_t::webkit:
+              if (!w->m_allow_external_drop.load() &&
+                  is_external_drag(sender)) {
+                // External drops disabled since the last draggingUpdated:
+                // let WebKit wind down the drag it was following, then
+                // refuse the drop.
+                w->m_drag_routes[drag_sequence(sender)] =
+                    drag_route_t::rejected;
+                call_webview_super_exited(self, sender);
+                return NO;
+              }
+              return call_webview_super<BOOL>(self, sel, sender);
+            }
+            return NO;
+          } catch (...) {
+            return NO;
+          }
+        }),
+        bool_types);
+    add_drag_method(
+        "performDragOperation:",
+        (IMP)(+[](id self, SEL sel, id sender) -> BOOL {
+          try {
+            auto w = get_associated_webview(self);
+            if (!w) {
+              return call_webview_super<BOOL>(self, sel, sender);
+            }
+            switch (peek_drag_route(self, w, sender)) {
+            case drag_route_t::rejected:
+              // Kept (as rejected) until draggingEnded:, so the end of a
+              // session WebKit never followed is not forwarded to it.
+              return NO;
+            case drag_route_t::file_drop: {
+              w->m_drag_routes[drag_sequence(sender)] = drag_route_t::rejected;
+              if (!file_drop_still_allowed(self, sender)) {
+                return NO;
+              }
+              // The pasteboard is only valid during this call, so the paths
+              // are read now; the handler runs after AppKit's drag ends.
+              auto paths = dragged_file_paths(sender);
+              if (paths.empty()) {
+                return NO;
+              }
+              w->schedule_file_drop(std::move(paths));
+              return YES;
+            }
+            case drag_route_t::webkit:
+              if (!w->m_allow_external_drop.load() &&
+                  is_external_drag(sender)) {
+                // External drops disabled since prepareForDragOperation:.
+                // WebKit gets the exit now, so not the end later.
+                w->m_drag_routes[drag_sequence(sender)] =
+                    drag_route_t::rejected;
+                call_webview_super_exited(self, sender);
+                return NO;
+              }
+              // Forgotten here, so draggingEnded: (finding no route) still
+              // reaches WebKit, which followed the whole session.
+              take_drag_route(w, sender);
+              return call_webview_super<BOOL>(self, sel, sender);
+            }
+            return NO;
+          } catch (...) {
+            return NO;
+          }
+        }),
+        bool_types);
+    add_drag_method(
+        "draggingEnded:",
+        (IMP)(+[](id self, SEL sel, id sender) {
+          try {
+            auto w = get_associated_webview(self);
+            if (!w) {
+              call_webview_super_if_implemented(self, sel, sender);
+              return;
+            }
+            // Forgets the session however it ended (a refused
+            // prepareForDragOperation: is followed by no exit or perform).
+            // Only sessions WebKit was following get the end.
+            if (take_drag_route(w, sender) == drag_route_t::webkit) {
+              call_webview_super_if_implemented(self, sel, sender);
+            }
+          } catch (...) {
+          }
+        }),
+        "v@:@");
     objc_registerClassPair(cls);
     return cls;
+  }
+
+  // Runs the file drop handler from a one-shot timer on the main run loop,
+  // not from the main dispatch queue: the handler may call webview_destroy,
+  // whose teardown waits for a block queued on the main queue, and a block
+  // already running on that serial queue would never let it run. Nothing is
+  // called once the engine is being destroyed.
+  void schedule_file_drop(std::vector<std::string> paths) {
+    struct pending_drop {
+      cocoa_wkwebview_engine *w;
+      std::shared_ptr<std::atomic<bool>> alive;
+      std::vector<std::string> paths;
+    };
+    auto drop = new pending_drop{this, alive_token(), std::move(paths)};
+    CFRunLoopTimerContext context{};
+    context.info = drop;
+    // Called when the timer goes, whether or not it fired.
+    context.release = +[](const void *info) {
+      delete static_cast<const pending_drop *>(info);
+    };
+    auto timer = CFRunLoopTimerCreate(
+        kCFAllocatorDefault, CFAbsoluteTimeGetCurrent(), 0, 0, 0,
+        +[](CFRunLoopTimerRef, void *info) {
+          auto pending = static_cast<pending_drop *>(info);
+          if (!pending->alive->load()) {
+            return;
+          }
+          try {
+            pending->w->deliver_file_drop(pending->paths);
+          } catch (...) {
+            // Must not unwind into the run loop.
+          }
+        },
+        &context);
+    if (!timer) {
+      delete drop;
+      return;
+    }
+    auto main_loop = CFRunLoopGetMain();
+    CFRunLoopAddTimer(main_loop, timer, kCFRunLoopCommonModes);
+    CFRelease(timer); // the run loop holds it until it fires
+    CFRunLoopWakeUp(main_loop);
+  }
+
+  static NSInteger drag_sequence(id sender) {
+    if (!sender) {
+      return 0;
+    }
+    return objc::msg_send<NSInteger>(sender,
+                                     objc::selector("draggingSequenceNumber"));
+  }
+
+  // Decides the route of a drag session from its first message.
+  static drag_route_t decide_drag_route(id self, id sender) {
+    auto w = get_associated_webview(self);
+    if (!w) {
+      return drag_route_t::webkit;
+    }
+    if (!w->m_allow_external_drop.load() && is_external_drag(sender)) {
+      return drag_route_t::rejected;
+    }
+    if (takes_file_drag(self, sender)) {
+      return drag_route_t::file_drop;
+    }
+    return drag_route_t::webkit;
+  }
+
+  // The recorded route of the session, deciding (and recording) it when the
+  // session was never seen.
+  static drag_route_t peek_drag_route(id self, cocoa_wkwebview_engine *w,
+                                      id sender) {
+    auto seq = drag_sequence(sender);
+    auto found = w->m_drag_routes.find(seq);
+    if (found != w->m_drag_routes.end()) {
+      return found->second;
+    }
+    auto route = decide_drag_route(self, sender);
+    w->m_drag_routes[seq] = route;
+    return route;
+  }
+
+  // Forgets the session and returns the route it had (webkit when unseen).
+  static drag_route_t take_drag_route(cocoa_wkwebview_engine *w, id sender) {
+    auto found = w->m_drag_routes.find(drag_sequence(sender));
+    if (found == w->m_drag_routes.end()) {
+      return drag_route_t::webkit;
+    }
+    auto route = found->second;
+    w->m_drag_routes.erase(found);
+    return route;
+  }
+
+  static NSUInteger drag_operation_for(id self, SEL sel, id sender,
+                                       drag_route_t route) {
+    switch (route) {
+    case drag_route_t::rejected:
+      return 0; // NSDragOperationNone
+    case drag_route_t::file_drop:
+      return 1; // NSDragOperationCopy
+    case drag_route_t::webkit:
+      return call_webview_super<NSUInteger>(self, sel, sender);
+    }
+    return 0;
+  }
+
+  // True while a file drop session may still complete: a handler is set,
+  // external drops have not been disabled since the session started, and
+  // the source still allows copying (modifier keys can change that).
+  static bool file_drop_still_allowed(id self, id sender) {
+    auto w = get_associated_webview(self);
+    if (!w || !w->file_drop_handler() || !sender) {
+      return false;
+    }
+    if (!w->m_allow_external_drop.load() && is_external_drag(sender)) {
+      return false;
+    }
+    return copy_allowed(sender);
+  }
+
+  // True when the drag's source allows NSDragOperationCopy.
+  static bool copy_allowed(id sender) {
+    auto source_mask = objc::msg_send<NSUInteger>(
+        sender, objc::selector("draggingSourceOperationMask"));
+    return (source_mask & 1) != 0; // NSDragOperationCopy
   }
 
   // Calls WKWebView's own implementation of a drag method.
@@ -760,18 +1056,49 @@ private:
     return objc::invoke<Result>(objc_msgSendSuper, &super_info, sel, sender);
   }
 
+  static void call_webview_super_exited(id self, id sender) {
+    call_webview_super<void>(self, objc::selector("draggingExited:"), sender);
+  }
+
+  // For optional NSDraggingDestination methods WKWebView may not implement.
+  static void call_webview_super_if_implemented(id self, SEL sel, id sender) {
+    if (class_respondsToSelector(objc::get_class("WKWebView"), sel)) {
+      call_webview_super<void>(self, sel, sender);
+    }
+  }
+
   static id file_url_type() {
     return NSString_stringWithUTF8String("public.file-url");
   }
 
-  // True when the engine behind the WKWebView has a file drop handler and
-  // the drag carries file URLs.
+  // True when the drag originated outside this application. AppKit sets
+  // NSDraggingInfo.draggingSource to nil for drags from other apps (Finder,
+  // etc.) and non-nil for in-app / in-page drags.
+  static bool is_external_drag(id sender) {
+    if (!sender) {
+      return false;
+    }
+    objc::autoreleasepool arp;
+    return objc::msg_send<id>(sender, objc::selector("draggingSource")) ==
+           nullptr;
+  }
+
+  // True when the engine behind the WKWebView has a file drop handler, the
+  // drag comes from outside this application and carries file URLs, and its
+  // source allows copying. Drags inside the app stay with WebKit even when
+  // they carry file URLs.
   static bool takes_file_drag(id self, id sender) {
     auto w = get_associated_webview(self);
     if (!w || !w->file_drop_handler() || !sender) {
       return false;
     }
+    if (!is_external_drag(sender)) {
+      return false;
+    }
     objc::autoreleasepool arp;
+    if (!copy_allowed(sender)) {
+      return false;
+    }
     auto pasteboard =
         objc::msg_send<id>(sender, objc::selector("draggingPasteboard"));
     if (!pasteboard) {
@@ -834,15 +1161,34 @@ private:
       class_addMethod(
           cls, objc::selector("userContentController:didReceiveScriptMessage:"),
           (IMP)(+[](id self, SEL, id, id msg) {
-            // Bindings belong to the top-level document only: drop messages
-            // posted from any iframe so a cross-origin frame cannot call
-            // host bindings through window.webkit.messageHandlers.
-            if (!WKScriptMessage_is_from_main_frame(msg)) {
-              return;
+            try {
+              // Bindings belong to the top-level document only: drop
+              // messages posted from any iframe so a cross-origin frame
+              // cannot call host bindings through
+              // window.webkit.messageHandlers.
+              if (!msg || !WKScriptMessage_is_from_main_frame(msg)) {
+                return;
+              }
+              auto w = get_associated_webview(self);
+              if (!w) {
+                return; // engine gone; the handler outlived it
+              }
+              auto body = WKScriptMessage_get_body(msg);
+              // The bridge only posts strings; anything else (a page calling
+              // postMessage with an object) is not a binding call.
+              if (!body ||
+                  !objc::msg_send<BOOL>(body, objc::selector("isKindOfClass:"),
+                                        objc::get_class("NSString"))) {
+                return;
+              }
+              auto utf8 = NSString_get_UTF8String(body);
+              if (!utf8) {
+                return;
+              }
+              w->on_message(utf8);
+            } catch (...) {
+              // Must not unwind into WebKit.
             }
-            auto w = get_associated_webview(self);
-            w->on_message(
-                NSString_get_UTF8String(WKScriptMessage_get_body(msg)));
           }),
           "v@:@@");
       objc_registerClassPair(cls);
@@ -850,6 +1196,53 @@ private:
     auto instance{objc::Class_new(cls)};
     set_associated_webview(instance, this);
     return instance;
+  }
+
+  // Unregisters the "__webview__" script message handler, so the user content
+  // controller drops its strong reference to it and no message posted while
+  // the WKWebView winds down reaches this engine. Safe to call more than once.
+  void remove_script_message_handler() {
+    if (!m_script_message_handler) {
+      return;
+    }
+    objc::autoreleasepool arp;
+    set_associated_webview(m_script_message_handler, nullptr);
+    if (m_manager) {
+      WKUserContentController_removeScriptMessageHandlerForName(
+          m_manager, NSString_stringWithUTF8String("__webview__"));
+    }
+    m_script_message_handler = nullptr;
+  }
+
+  // Cuts every view and controller this engine created off from it and
+  // releases them: from windowWillClose: (the window is going, the engine
+  // stays until webview_destroy) and from the destructor. Afterwards no drag,
+  // script message or UI delegate call can reach this engine through them.
+  // Idempotent: each member is nulled as it is released.
+  void detach_and_release_views() {
+    objc::autoreleasepool arp;
+    remove_script_message_handler();
+    if (m_manager) {
+      WKUserContentController_removeScriptMessageHandlerForName(
+          m_manager, NSString_stringWithUTF8String("__webview__"));
+      objc::release(m_manager);
+      m_manager = nullptr;
+    }
+    m_drag_routes.clear();
+    if (m_webview) {
+      set_associated_webview(m_webview, nullptr);
+      if (auto ui_delegate{WKWebView_get_UIDelegate(m_webview)}) {
+        WKWebView_set_UIDelegate(m_webview, nullptr);
+        set_associated_webview(ui_delegate, nullptr);
+        objc::release(ui_delegate);
+      }
+      objc::release(m_webview);
+      m_webview = nullptr;
+    }
+    if (m_widget) {
+      objc::release(m_widget);
+      m_widget = nullptr;
+    }
   }
   static id create_webkit_ui_delegate() {
     objc::autoreleasepool arp;
@@ -968,9 +1361,9 @@ private:
     window_init_proceed();
   }
   void on_window_will_close(id /*delegate*/, id /*window*/) {
-    // Widget destroyed along with window.
-    m_widget = nullptr;
-    m_webview = nullptr;
+    // The window keeps the views alive until it goes; this engine lets go of
+    // them now so nothing left behind still points at it.
+    detach_and_release_views();
     m_window = nullptr;
     dispatch([this] { on_window_destroyed(); });
   }
@@ -979,7 +1372,10 @@ private:
 
     auto config{objc::autorelease(WKWebViewConfiguration_new())};
 
-    m_manager = WKWebViewConfiguration_get_userContentController(config);
+    // Retained so teardown can still unregister the script message handler
+    // after the window (and with it the WKWebView) has gone.
+    m_manager = objc::retain(
+        WKWebViewConfiguration_get_userContentController(config));
 
     auto url_scheme_handler = objc::autorelease(create_url_scheme_handler());
     m_url_scheme_handler = objc::retain(url_scheme_handler);
@@ -1047,6 +1443,9 @@ private:
 
     auto script_message_handler =
         objc::autorelease(create_script_message_handler());
+    // Unretained: the user content controller holds it until
+    // remove_script_message_handler() unregisters it.
+    m_script_message_handler = script_message_handler;
     WKUserContentController_addScriptMessageHandler(
         m_manager, script_message_handler,
         NSString_stringWithUTF8String("__webview__"));
@@ -1154,6 +1553,12 @@ private:
   id m_webview{};
   id m_manager{};
   bool m_is_window_shown{};
+  std::atomic<bool> m_allow_external_drop{true};
+  // Route of every drag session currently over the WKWebView, by
+  // NSDraggingInfo.draggingSequenceNumber; main thread only.
+  std::map<NSInteger, drag_route_t> m_drag_routes;
+  // The "__webview__" script message handler (owned by m_manager).
+  id m_script_message_handler{};
   id m_url_scheme_handler{};
   // Tasks handed to the request handler and not yet answered or stopped;
   // each is retained.

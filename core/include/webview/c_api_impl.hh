@@ -39,6 +39,8 @@
 #include "version.h"
 
 #include <atomic>
+#include <cstdint>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
@@ -261,6 +263,12 @@ WEBVIEW_API webview_error_t webview_set_asset(webview_t w, const char *path,
                                               const void *data, size_t len) {
   using namespace webview::detail;
   if (!path || !mime || (!data && len > 0)) {
+    return WEBVIEW_ERROR_INVALID_ARGUMENT;
+  }
+  // Checked again by the engine; refused here too so a bad MIME type or
+  // size never reaches the instance.
+  if (!http_is_valid_header_value(mime) ||
+      len > static_cast<size_t>((std::numeric_limits<std::uint32_t>::max)())) {
     return WEBVIEW_ERROR_INVALID_ARGUMENT;
   }
   return api_filter(

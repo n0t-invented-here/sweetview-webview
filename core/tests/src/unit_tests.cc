@@ -812,3 +812,150 @@ TEST_CASE("Streaming and file drop C API: argument checks") {
           WEBVIEW_ERROR_INVALID_STATE);
 }
 #endif
+
+#include <cstdint>
+#include <limits>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+namespace {
+// A windowless engine for exercising engine_base itself. Everything a real
+// backend does is refused; set_file_drop_handler_impl answers with whatever
+// the test asks for.
+class stub_engine : public webview::detail::engine_base {
+public:
+  stub_engine() : engine_base{false} {}
+  using engine_base::deliver_file_drop;
+  using engine_base::file_drop_handler;
+  webview::noresult next_file_drop_result{};
+
+protected:
+  using noresult = webview::noresult;
+  template <typename T> using result = webview::result<T>;
+  using user_script = webview::detail::user_script;
+
+  noresult navigate_impl(const std::string &) override { return refuse(); }
+  result<void *> window_impl() override { return refuse(); }
+  result<void *> widget_impl() override { return refuse(); }
+  result<void *> browser_controller_impl() override { return refuse(); }
+  noresult run_impl() override { return refuse(); }
+  noresult terminate_impl() override { return refuse(); }
+  noresult dispatch_impl(std::function<void()>) override { return refuse(); }
+  noresult set_title_impl(const std::string &) override { return refuse(); }
+  noresult set_size_impl(int, int, webview_hint_t) override {
+    return refuse();
+  }
+  noresult set_html_impl(const std::string &) override { return refuse(); }
+  noresult eval_impl(const std::string &) override { return refuse(); }
+  user_script add_user_script_impl(const std::string &) override {
+    throw std::logic_error{"not supported"};
+  }
+  void remove_all_user_scripts_impl(const std::list<user_script> &) override {}
+  bool are_user_scripts_equal_impl(const user_script &,
+                                   const user_script &) override {
+    return false;
+  }
+  void run_event_loop_while(std::function<bool()>) override {}
+  noresult set_file_drop_handler_impl(bool) override {
+    return next_file_drop_result;
+  }
+
+private:
+  static webview::error_info refuse() {
+    return webview::error_info{WEBVIEW_ERROR_INVALID_STATE};
+  }
+};
+
+// Which stub handler last ran, and with what argument.
+int stub_drop_called = 0;
+void *stub_drop_arg = nullptr;
+void stub_drop_a(const char *, void *arg) {
+  stub_drop_called = 1;
+  stub_drop_arg = arg;
+}
+void stub_drop_b(const char *, void *arg) {
+  stub_drop_called = 2;
+  stub_drop_arg = arg;
+}
+} // namespace
+
+// webview_set_asset refuses a MIME type that could split or smuggle a
+// Content-Type header, and a body too large to serve, before it touches
+// the instance.
+TEST_CASE("webview_set_asset: MIME and size validation") {
+  int not_a_webview = 0;
+  const char body[] = "x";
+  REQUIRE(webview_set_asset(&not_a_webview, "a.txt", "text/plain\r\nX: y",
+                            body, 1) == WEBVIEW_ERROR_INVALID_ARGUMENT);
+  REQUIRE(webview_set_asset(&not_a_webview, "a.txt", "text/plain\nX: y", body,
+                            1) == WEBVIEW_ERROR_INVALID_ARGUMENT);
+  REQUIRE(webview_set_asset(&not_a_webview, "a.txt", "text/plain\rX", body,
+                            1) == WEBVIEW_ERROR_INVALID_ARGUMENT);
+  REQUIRE(webview_set_asset(&not_a_webview, "a.txt", "text/\x01plain", body,
+                            1) == WEBVIEW_ERROR_INVALID_ARGUMENT);
+  REQUIRE(webview_set_asset(&not_a_webview, nullptr, "text/plain", body, 1) ==
+          WEBVIEW_ERROR_INVALID_ARGUMENT);
+  REQUIRE(webview_set_asset(&not_a_webview, "a.txt", nullptr, body, 1) ==
+          WEBVIEW_ERROR_INVALID_ARGUMENT);
+  if (sizeof(size_t) > sizeof(std::uint32_t)) {
+    // Never read: the size is refused first.
+    const auto too_big =
+        static_cast<size_t>((std::numeric_limits<std::uint32_t>::max)()) + 1;
+    REQUIRE(webview_set_asset(&not_a_webview, "a.txt", "text/plain", body,
+                              too_big) == WEBVIEW_ERROR_INVALID_ARGUMENT);
+  }
+
+  // The engine applies the same rules for C++ callers.
+  stub_engine engine;
+  REQUIRE(engine.set_asset("a.txt", "text/plain\r\nX: y", body, 1).error()
+              .code() == WEBVIEW_ERROR_INVALID_ARGUMENT);
+  REQUIRE(engine.set_asset("a.txt", "text/plain\n", body, 1).error().code() ==
+          WEBVIEW_ERROR_INVALID_ARGUMENT);
+  REQUIRE(engine.find_asset("a.txt") == nullptr);
+  if (sizeof(size_t) > sizeof(std::uint32_t)) {
+    const auto too_big =
+        static_cast<size_t>((std::numeric_limits<std::uint32_t>::max)()) + 1;
+    REQUIRE(engine.set_asset("a.txt", "text/plain", body, too_big)
+                .error()
+                .code() == WEBVIEW_ERROR_INVALID_ARGUMENT);
+    REQUIRE(engine.find_asset("a.txt") == nullptr);
+  }
+  // Tab and UTF-8 are valid in a header value.
+  REQUIRE(engine.set_asset("a.txt", "text/plain;\tcharset=utf-8", body, 1)
+              .ok());
+  REQUIRE(engine.find_asset("a.txt") != nullptr);
+}
+
+// A file drop handler the backend refuses leaves the previous one, and the
+// argument it was set with, in place.
+TEST_CASE("set_file_drop_handler: restores the previous handler on failure") {
+  stub_engine engine;
+  int arg_a = 0;
+  int arg_b = 0;
+  const std::vector<std::string> paths{"/tmp/a.txt"};
+  auto delivered_to = [&](int handler, void *arg) {
+    stub_drop_called = 0;
+    stub_drop_arg = nullptr;
+    engine.deliver_file_drop(paths);
+    return stub_drop_called == handler && stub_drop_arg == arg;
+  };
+  REQUIRE(engine.set_file_drop_handler(stub_drop_a, &arg_a).ok());
+  REQUIRE(engine.file_drop_handler() == stub_drop_a);
+  REQUIRE(delivered_to(1, &arg_a));
+
+  engine.next_file_drop_result =
+      webview::error_info{WEBVIEW_ERROR_UNSPECIFIED, "refused"};
+  auto res = engine.set_file_drop_handler(stub_drop_b, &arg_b);
+  REQUIRE(!res.ok());
+  REQUIRE(engine.file_drop_handler() == stub_drop_a);
+  REQUIRE(delivered_to(1, &arg_a));
+  res = engine.set_file_drop_handler(nullptr, nullptr);
+  REQUIRE(!res.ok());
+  REQUIRE(engine.file_drop_handler() == stub_drop_a);
+  REQUIRE(delivered_to(1, &arg_a));
+
+  engine.next_file_drop_result = webview::noresult{};
+  REQUIRE(engine.set_file_drop_handler(nullptr, nullptr).ok());
+  REQUIRE(engine.file_drop_handler() == nullptr);
+}

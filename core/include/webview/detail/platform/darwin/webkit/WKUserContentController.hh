@@ -44,6 +44,12 @@ inline void WKUserContentController_addScriptMessageHandler(id self, id handler,
                        handler, name);
 }
 
+inline void WKUserContentController_removeScriptMessageHandlerForName(id self,
+                                                                    id name) {
+  objc::msg_send<void>(
+      self, objc::selector("removeScriptMessageHandlerForName:"), name);
+}
+
 inline void WKUserContentController_addUserScript(id self, id user_script) {
   objc::msg_send<void>(self, objc::selector("addUserScript:"), user_script);
 }

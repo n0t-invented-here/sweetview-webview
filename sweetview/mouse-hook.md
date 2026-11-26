@@ -53,12 +53,14 @@ typedef int (*webview_mouse_hook_fn_t)(int event, double x, double y, double whe
 | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | Windows  | A low-level mouse hook (`WH_MOUSE_LL`) on the calling thread, which must pump messages; `webview_run` does                                                                                                                                                                     |
 | macOS    | A `CGEventTap` at the session level on the main run loop, shared with the keyboard hook. The process needs **Device Control and Data Access**; see [Permissions](permissions.md). A tap the system disables for being slow is re-enabled by the library                       |
-| Linux    | Not supported; fails with `WEBVIEW_ERROR_UNSPECIFIED`                                                                                                                                                                                                                          |
+| Linux    | Not supported; fails with `WEBVIEW_ERROR_UNSPECIFIED` ([why](README.md#linux))                                                                                                                                                                                                                          |
 
 ## Errors
 
 | Code                               | When                                                                   |
 | ---------------------------------- | ---------------------------------------------------------------------- |
+| `WEBVIEW_ERROR_INVALID_ARGUMENT`   | `fn` is `NULL` |
 | `WEBVIEW_ERROR_DUPLICATE`          | A mouse hook is already installed                                      |
-| `WEBVIEW_ERROR_MISSING_DEPENDENCY` | macOS: the permission is missing (the system was asked, if auto-request is on) |
+| `WEBVIEW_ERROR_MISSING_DEPENDENCY` | macOS: the event tap could not be created, reported as the permission missing (the system was asked, if auto-request is on) |
+| `WEBVIEW_ERROR_UNSPECIFIED`        | Windows: `SetWindowsHookEx` failed; Linux: not supported |
 | `WEBVIEW_ERROR_NOT_FOUND`          | `webview_mouse_hook_remove` with no hook installed                     |

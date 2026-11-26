@@ -9,6 +9,12 @@ webview_error_t webview_set_request_handler(webview_t w, webview_request_handler
 webview_error_t webview_complete_request(webview_t w, uint64_t request_id, int status,
                                          const char *headers_json, const void *body,
                                          size_t body_len);
+
+webview_error_t webview_begin_response(webview_t w, uint64_t request_id, int status,
+                                       const char *headers_json);
+webview_error_t webview_write_response_chunk(webview_t w, uint64_t request_id,
+                                             const void *chunk, size_t chunk_len);
+webview_error_t webview_end_response(webview_t w, uint64_t request_id);
 ```
 
 Answers requests to the webview's origins in code instead of from fixed bytes.
@@ -26,17 +32,19 @@ Two origins go to the handler:
 | -------- | --------------------------------------- | --------------------------------- | ------------------------------------------------------------------------------- |
 | Windows  | `http://webview.localhost`              | `http://frames.webview.localhost` | WebView2's `WebResourceRequested`, held open with `GetDeferral` until completed |
 | macOS    | `webview://localhost`                   | `webview-frames://localhost`      | One `WKURLSchemeHandler` for the schemes `webview` and `webview-frames`         |
-| Linux    |                                         |                                   | Accepted and stored; not served                                                 |
+| Linux    |                                         |                                   | Accepted and stored; not served ([why](README.md#linux))                        |
 
 - On the main origin, an asset set with `webview_set_asset` answers first, at no extra cost; only
   paths with no asset reach the handler.
 - The frames origin is for content that must be cross-origin from the page, such as a sandboxed
   `<iframe>`: the browser keeps the page out of its document, and the two talk through `postMessage`.
 - Without a handler, both answer 404 for anything with no asset.
-- Windows: the filters catch requests from service workers and shared workers as well as documents
-  (`ICoreWebView2_22::AddWebResourceRequestedFilterWithRequestSourceKinds`, all source kinds) when the
-  WebView2 Runtime has it (Runtime 125 or later; the build needs WebView2 SDK 1.0.2478.35 or later).
-  An older Runtime falls back to `AddWebResourceRequestedFilter`, which sees only document requests.
+- Windows: where the WebView2 Runtime has `ICoreWebView2_22` (Runtime 122.0.2365.46 or later; the
+  interface shipped in SDK 1.0.2365.46, and this build is configured with SDK 1.0.2478.35), the filters
+  are added with `AddWebResourceRequestedFilterWithRequestSourceKinds` and all source kinds, so they
+  catch requests from service workers, shared workers and cross-origin iframes as well as documents.
+  An older Runtime falls back to the legacy `AddWebResourceRequestedFilter`, which misses requests from
+  service and shared workers and from cross-origin iframes.
 
 ## The handler
 
@@ -49,6 +57,9 @@ returns.
 - Every pointer is valid only for the duration of the call.
 - A request whose body stream fails partway never reaches the handler with a partial body: Windows
   answers it 500, macOS fails the task with the stream's `NSError`.
+- A handler that throws (C++) never lets the exception reach the browser: a request it neither
+  answered with `webview_complete_request` nor began with `webview_begin_response` is answered with a
+  bare 500.
 
 ## Completing
 
@@ -78,19 +89,44 @@ returns.
 | Windows  | Each `[name, value]` pair as its own header line; several `Set-Cookie` headers work.                                                                                                                                                 |
 | macOS    | `NSHTTPURLResponse` holds one value per name. Names match without regard to case and keep the casing first seen; repeats are joined with `", "`. `Set-Cookie` cannot be joined (RFC 9110 5.3), so only the first is kept: **at most one `Set-Cookie` per response on macOS**. |
 
+## Streaming
+
+`webview_begin_response` starts an answer with its status and headers; the body then follows in
+pieces through `webview_write_response_chunk` and ends with `webview_end_response`. Use it instead of
+`webview_complete_request`, never both for one request.
+
+- All three may be called from any thread. `begin` checks `status` and `headers_json` exactly like
+  `webview_complete_request`; `write` copies the chunk before it returns.
+- `chunk_len`: at most 4294967295 (`UINT32_MAX`); `NULL` with a length is refused. A zero-length
+  chunk does nothing once the handle and arguments pass (after `webview_destroy` has begun it still
+  returns `WEBVIEW_ERROR_INVALID_STATE`).
+- Beginning a request already answered or cancelled does nothing, and its chunks are dropped.
+  Beginning one whose stream is already open returns `WEBVIEW_ERROR_DUPLICATE` on Windows; macOS
+  ignores the second begin.
+- Ending a response twice, or one never begun, does nothing; a request never begun can still be
+  answered with `webview_complete_request`.
+
+| Platform | How                                                                                                                                                                                                                                                                                                                                                  |
+| -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Windows  | The response's content is an `IStream` whose `Read()` blocks on WebView2's background thread until a chunk or the end arrives; the UI thread never waits and only unread bytes are held. WebView2 reads the whole stream before it hands the response to the page (WebView2Feedback #3519), so the page receives the body at `webview_end_response`, not chunk by chunk |
+| macOS    | `WKURLSchemeTask` `didReceiveResponse:`, then `didReceiveData:` per chunk and `didFinish`, each on the main queue in the order called, so Server-Sent Events and large media reach the page as they are written. A task WebKit stops is forgotten; later chunks and the end do nothing                                                                     |
+| Linux    | Accepted; does nothing ([why](README.md#linux))                                                                                                                                                                                                                                                                                                      |
+
 ## Teardown
 
 Requests still open when the webview is destroyed are closed and released without an answer, on
 both platforms; none of them is ever passed on to the network:
 
-- Windows: the WebView2 controller is closed first, then each deferral and its event args are
+- Windows: every open stream is aborted first (a `Read()` blocked on WebView2's thread fails and
+  returns), then the WebView2 controller is closed, then each pending deferral and its event args are
   released without `Complete()`.
-- macOS: the retained tasks are released without an answer; WebKit stops them as the `WKWebView`
-  goes.
+- macOS: the retained tasks, streamed or not, are released without an answer; WebKit stops them as
+  the `WKWebView` goes.
+- On both, answers and stream steps still queued for the UI thread do nothing when they run.
 
 Completing against teardown:
 
-- `webview_complete_request` may race `webview_destroy` from any thread. The library keeps a
+- `webview_complete_request` and the streaming calls may race `webview_destroy` from any thread. The library keeps a
   registry of live webviews: `webview_destroy` first marks the webview as going and removes it, under
   a lock, before deleting it, and `webview_complete_request` validates, copies and queues under the
   same lock. After `webview_destroy` has begun it returns `WEBVIEW_ERROR_INVALID_STATE`.

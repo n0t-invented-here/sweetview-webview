@@ -32,6 +32,18 @@
 
 #include <stddef.h>
 
+/*
+ * Linux: Sweetview keeps the upstream webview/webview C ABI, so every
+ * function below exists on every platform and a program built against it
+ * links everywhere. Sweetview's fork additions (assets, the request handler
+ * and streaming, background color, external drop control, the file drop
+ * handler, input hooks and permissions) are implemented for Windows
+ * (WebView2) and macOS (WKWebView) only. On Linux (GTK/WebKitGTK) they are
+ * accepted and do nothing, or fail with WEBVIEW_ERROR_UNSPECIFIED where a
+ * silent no-op would mislead (the input hooks); each function's Remarks say
+ * which.
+ */
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -151,19 +163,31 @@ WEBVIEW_API webview_error_t webview_set_size(webview_t w, int width, int height,
  * Sets the color the browser paints behind the page. With alpha 0 and a page
  * whose own background is transparent, the native window shows through.
  *
+ * Every channel must be 0-255; anything outside that returns
+ * WEBVIEW_ERROR_INVALID_ARGUMENT and changes nothing.
+ *
  * Remarks:
- * - Windows: sets ICoreWebView2Controller2::DefaultBackgroundColor. The host
- *   window still needs DWM composition that honors alpha (for example
- *   DwmEnableBlurBehindWindow with an empty region) for true transparency.
- * - macOS: turns drawsBackground off on the WKWebView and makes the window
- *   non-opaque with this color as its background.
- * - Linux: accepted; does nothing.
+ * - Windows: sets ICoreWebView2Controller2::DefaultBackgroundColor. WebView2
+ *   takes only alpha 0 (fully transparent) or 255 (opaque); any other alpha
+ *   is refused by WebView2 and returns WEBVIEW_ERROR_UNSPECIFIED. A Runtime
+ *   without ICoreWebView2Controller2 also returns WEBVIEW_ERROR_UNSPECIFIED.
+ *   The host window still needs DWM composition that honors alpha (for
+ *   example DwmEnableBlurBehindWindow with an empty region) for true
+ *   transparency.
+ * - macOS: sets the WKWebView's drawsBackground (KVC) to NO when @p a is 0
+ *   and YES otherwise; sets this color as the window's background and makes
+ *   the window non-opaque unless @p a is 255.
+ * - Linux: accepted; does nothing (see "Linux" in the file overview).
  *
  * @param w The webview instance.
  * @param r Red, 0-255.
  * @param g Green, 0-255.
  * @param b Blue, 0-255.
  * @param a Alpha, 0-255 (0 is fully transparent).
+ * @return WEBVIEW_ERROR_INVALID_ARGUMENT for a channel outside 0-255;
+ *         WEBVIEW_ERROR_INVALID_STATE when the browser is not created yet or
+ *         already gone; WEBVIEW_ERROR_UNSPECIFIED when the platform refuses
+ *         the color (see Remarks).
  */
 WEBVIEW_API webview_error_t webview_set_background_color(webview_t w, int r,
                                                          int g, int b, int a);
@@ -180,7 +204,14 @@ WEBVIEW_API webview_error_t webview_set_background_color(webview_t w, int r,
  *   requests to any other origin are untouched).
  * - macOS: webview://localhost (a WKURLSchemeHandler for the scheme "webview",
  *   registered when the WKWebView is created).
- * - Linux: accepted and stored; not served.
+ * - Linux: accepted and stored; not served (see "Linux" in the file overview).
+ *
+ * Validation, all before anything is stored: @p path and @p mime must not be
+ * NULL, @p data may be NULL only when @p len is 0, @p mime must be a valid
+ * HTTP header value (no CR, LF, NUL or other control character but tab, so it
+ * cannot split or add a header), and @p len must be at most 4294967295
+ * (UINT32_MAX). Anything else returns WEBVIEW_ERROR_INVALID_ARGUMENT and
+ * leaves the asset table as it was.
  *
  * Example:
  * @code{.c}
@@ -194,8 +225,9 @@ WEBVIEW_API webview_error_t webview_set_background_color(webview_t w, int r,
  *             and fragment are ignored when matching. Must not need
  *             percent-encoding.
  * @param mime Value for the Content-Type header.
- * @param data The bytes.
- * @param len Length of @p data in bytes.
+ * @param data The bytes, or NULL when @p len is 0.
+ * @param len Length of @p data in bytes, at most 4294967295 (UINT32_MAX).
+ * @return WEBVIEW_ERROR_INVALID_ARGUMENT for a bad argument (see above).
  */
 WEBVIEW_API webview_error_t webview_set_asset(webview_t w, const char *path,
                                               const char *mime,
@@ -225,21 +257,33 @@ WEBVIEW_API webview_error_t webview_set_asset(webview_t w, const char *path,
  * A request whose body cannot be read in full never reaches @p fn: Windows
  * answers it 500, macOS fails the task with an NSError.
  *
+ * If @p fn throws (C++ callers), the exception goes no further: a request it
+ * neither answered with webview_complete_request nor began with
+ * webview_begin_response is answered with a bare 500.
+ *
  * Remarks:
  * - Windows: WebView2's WebResourceRequested event, deferred
- *   (ICoreWebView2Deferral) until the request is completed. Requests from
- *   service workers and shared workers are caught too where the WebView2
- *   Runtime has ICoreWebView2_22 (Runtime 125 or later); an older Runtime
- *   only reports requests from documents. When a response cannot be built
- *   (WebView2 refuses the headers, no memory for the body) the request is
- *   answered with a bare 500 instead, so it never goes on to the network.
- *   Destroying the webview answers every request still open with 503.
+ *   (ICoreWebView2Deferral) until the request is completed. Where the
+ *   WebView2 Runtime has ICoreWebView2_22 (Runtime 122.0.2365.46 or later,
+ *   SDK 1.0.2365.46; this build is configured with SDK 1.0.2478.35) the
+ *   filter is added with source kinds "all", so requests from service
+ *   workers, shared workers and cross-origin iframes are caught too. An
+ *   older Runtime falls back to the legacy filter, which misses requests
+ *   from service and shared workers and from cross-origin iframes. When a
+ *   response cannot be built (WebView2 refuses the headers, no memory for
+ *   the body) the request is answered with a bare 500 instead, so it never
+ *   goes on to the network. Destroying the webview aborts every stream
+ *   still open, closes the WebView2 controller, and releases the deferrals
+ *   and event arguments of requests still pending without answering them;
+ *   answers still queued do nothing when they run.
  * - macOS: a WKURLSchemeHandler for the schemes "webview" and
  *   "webview-frames". A task WebKit stops before it is completed is dropped,
  *   and completing it later does nothing. Destroying the webview releases
- *   the tasks still open without answering them; WebKit stops them as the
- *   WKWebView goes.
- * - Linux: accepted and stored; not served.
+ *   the tasks still open (retained by the engine) without answering them;
+ *   WebKit stops them as the WKWebView goes. Answers still queued do nothing
+ *   when they run.
+ * - Linux: accepted and stored; not served (see "Linux" in the file
+ *   overview).
  *
  * @param w The webview instance.
  * @param fn The handler, or NULL to remove it.
@@ -309,7 +353,10 @@ WEBVIEW_API webview_error_t webview_complete_request(webview_t w,
  * webview_complete_request: @p status and @p headers_json are checked before
  * this returns, and once webview_destroy has begun this returns
  * WEBVIEW_ERROR_INVALID_STATE. Starting a request that was already answered
- * or cancelled does nothing; the chunks written for it are dropped.
+ * or cancelled does nothing; the chunks written for it are dropped. Starting
+ * one whose streamed response has already begun returns
+ * WEBVIEW_ERROR_DUPLICATE on Windows while that stream is open; macOS
+ * ignores the second start.
  *
  * Remarks:
  * - Windows: the response's content is an IStream whose Read() blocks on
@@ -319,11 +366,16 @@ WEBVIEW_API webview_error_t webview_complete_request(webview_t w,
  *   whole stream before it hands the response to the page (a documented
  *   WebView2 limitation: a WebResourceRequested response is never delivered
  *   in parts), so the page receives the body at webview_end_response, not
- *   chunk by chunk. Destroying the webview aborts every stream still open.
+ *   chunk by chunk. Destroying the webview aborts every stream still open
+ *   (WebView2's pending Read() fails) and drops queued steps.
  * - macOS: WKURLSchemeTask didReceiveResponse:, then didReceiveData: per
- *   chunk and didFinish, each on the main queue. A task WebKit stops is
- *   forgotten, and later chunks and the end do nothing.
- * - Linux: accepted; does nothing.
+ *   chunk and didFinish, each on the main queue in the order called. A task
+ *   WebKit stops is forgotten, and later chunks and the end do nothing.
+ *   Destroying the webview releases open tasks without finishing them.
+ * - Linux: accepted; does nothing (see "Linux" in the file overview).
+ *
+ * Calling webview_end_response for a request that was never begun does
+ * nothing, so webview_complete_request may still answer it.
  *
  * @param w The webview instance.
  * @param request_id The @c request_id the handler received.
@@ -332,7 +384,9 @@ WEBVIEW_API webview_error_t webview_complete_request(webview_t w,
  *                     webview_complete_request. NULL or "" for none.
  * @return WEBVIEW_ERROR_INVALID_STATE when @p w is destroyed or being
  *         destroyed; WEBVIEW_ERROR_INVALID_ARGUMENT for a bad argument or bad
- *         headers.
+ *         headers (request_id 0, status outside 100-599);
+ *         WEBVIEW_ERROR_DUPLICATE (Windows) when a stream for @p request_id
+ *         is already open.
  */
 WEBVIEW_API webview_error_t webview_begin_response(webview_t w,
                                                    uint64_t request_id,
@@ -344,7 +398,8 @@ WEBVIEW_API webview_error_t webview_begin_response(webview_t w,
  * webview_begin_response. Safe to call from any thread; the bytes are copied
  * before this returns. A chunk for a response that has ended, was never
  * started, or that the page abandoned is dropped. @p chunk_len 0 does
- * nothing.
+ * nothing once the checks below pass (after webview_destroy has begun it
+ * still returns WEBVIEW_ERROR_INVALID_STATE).
  *
  * @param w The webview instance.
  * @param request_id The @c request_id passed to webview_begin_response.
@@ -374,11 +429,22 @@ WEBVIEW_API webview_error_t webview_end_response(webview_t w,
 
 /**
  * Sets whether files and other content dragged from outside the app can be
- * dropped on the page. Allowed by default.
+ * dropped on the page. Allowed by default. Drags that start inside the page
+ * (in-page drag and drop) keep working either way. A file drop handler (see
+ * webview_set_file_drop_handler) receives drops only while external drops
+ * are allowed.
  *
  * Remarks:
- * - Windows: ICoreWebView2Controller4::AllowExternalDrop.
- * - macOS, Linux: accepted; does nothing.
+ * - Windows: ICoreWebView2Controller4::AllowExternalDrop, which allows or
+ *   refuses external drops for the whole WebView2 control. A Runtime without
+ *   ICoreWebView2Controller4 returns WEBVIEW_ERROR_UNSPECIFIED.
+ * - macOS: enforced by the engine's WKWebView subclass (SweetviewWKWebView):
+ *   while refused, a drag whose NSDraggingInfo.draggingSource is nil (it
+ *   comes from another app, such as Finder) gets NSDragOperationNone and
+ *   never reaches WebKit, while drags from inside the app still go to
+ *   WebKit. Each drag session is routed once when it enters; turning
+ *   external drops off mid-drag ends the session it affects.
+ * - Linux: accepted; does nothing (see "Linux" in the file overview).
  *
  * @param w The webview instance.
  * @param allow Non-zero to allow, 0 to refuse.
@@ -395,19 +461,32 @@ WEBVIEW_API webview_error_t webview_set_allow_external_drop(webview_t w,
  * removes the handler and restores the page's own handling. Call from the UI
  * thread.
  *
+ * On both Windows and macOS the handler needs external drops allowed (see
+ * webview_set_allow_external_drop), and @p fn is called asynchronously, from
+ * the UI thread's message loop after the operating system's drop event has
+ * returned, so it may set or clear the handler, open dialogs, or destroy the
+ * webview. @p paths_json is a JSON array of strings; @p fn is never called
+ * with an empty array.
+ *
+ * Setting the handler is transactional: when the backend refuses the change
+ * (for example the Windows drop script cannot be installed), the previous
+ * handler and argument stay in place and the error is returned.
+ *
  * Remarks:
  * - Windows: drops are captured only on the trusted top-level document,
  *   never inside an iframe (cross-origin or not). The top-level document's
  *   drop event hands the dropped File objects to the host with
  *   chrome.webview.postMessageWithAdditionalObjects, and WebView2's
  *   ICoreWebView2File attachment gives their paths; a drop on an iframe is
- *   left to the iframe and never reaches @p fn. @p fn is called from the
- *   message loop after WebView2's event has returned, so it may set or clear
- *   the handler, open dialogs, or destroy the webview. Needs external drop
- *   allowed (see webview_set_allow_external_drop) and WebView2 Runtime 113 or
- *   later.
- * - macOS: the WKWebView takes the drag when its pasteboard holds file URLs.
- * - Linux: accepted; does nothing.
+ *   left to the iframe and never reaches @p fn. Needs WebView2 Runtime 113
+ *   or later.
+ * - macOS: the engine's WKWebView subclass (SweetviewWKWebView) takes a
+ *   drag session when a handler is set, its pasteboard holds file URLs
+ *   (public.file-url) and its source allows copying; any other drag goes to
+ *   WebKit. The paths are read from the pasteboard during
+ *   performDragOperation: and @p fn runs on the main queue afterwards.
+ *   Clearing the handler mid-drag refuses the drop.
+ * - Linux: accepted; does nothing (see "Linux" in the file overview).
  *
  * @param w The webview instance.
  * @param fn The handler, or NULL to remove it.
@@ -448,8 +527,12 @@ WEBVIEW_API webview_error_t webview_set_file_drop_handler(
  *
  * @param fn The callback.
  * @param arg Passed to @p fn as its last argument.
+ * @retval WEBVIEW_ERROR_INVALID_ARGUMENT @p fn is NULL.
  * @retval WEBVIEW_ERROR_DUPLICATE A mouse hook is already installed.
- * @retval WEBVIEW_ERROR_MISSING_DEPENDENCY macOS: the permission is missing.
+ * @retval WEBVIEW_ERROR_MISSING_DEPENDENCY macOS: the event tap could not be
+ *         created, which is reported as the permission missing.
+ * @retval WEBVIEW_ERROR_UNSPECIFIED Windows: SetWindowsHookEx failed; Linux:
+ *         not supported.
  */
 WEBVIEW_API webview_error_t webview_mouse_hook_install(webview_mouse_hook_fn_t fn,
                                                        void *arg);
@@ -493,8 +576,12 @@ WEBVIEW_API webview_error_t webview_mouse_hook_remove(void);
  *
  * @param fn The callback.
  * @param arg Passed to @p fn as its last argument.
+ * @retval WEBVIEW_ERROR_INVALID_ARGUMENT @p fn is NULL.
  * @retval WEBVIEW_ERROR_DUPLICATE A keyboard hook is already installed.
- * @retval WEBVIEW_ERROR_MISSING_DEPENDENCY macOS: the permission is missing.
+ * @retval WEBVIEW_ERROR_MISSING_DEPENDENCY macOS: the event tap could not be
+ *         created, which is reported as the permission missing.
+ * @retval WEBVIEW_ERROR_UNSPECIFIED Windows: SetWindowsHookEx failed; Linux:
+ *         not supported.
  */
 WEBVIEW_API webview_error_t
 webview_keyboard_hook_install(webview_keyboard_hook_fn_t fn, void *arg);
