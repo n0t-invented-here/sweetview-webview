@@ -568,9 +568,22 @@ private:
     auto request_id = next_request_id();
     m_pending_tasks[request_id] = objc::retain(task);
 
-    handler(request_id, method.c_str(), url_string.c_str(),
-            headers_json.c_str(), body.empty() ? nullptr : body.data(),
-            body.size(), request_handler_arg());
+    try {
+      handler(request_id, method.c_str(), url_string.c_str(),
+              headers_json.c_str(), body.empty() ? nullptr : body.data(),
+              body.size(), request_handler_arg());
+    } catch (...) {
+      // A handler that throws must not strand the request: unless it already
+      // submitted an answer through webview_complete_request (queued, not yet
+      // run), answer it here with a bare 500. The exception goes no further.
+      if (!is_request_submitted(request_id)) {
+        try {
+          complete_request_impl(request_id, 500, http_headers_t{},
+                                std::string{});
+        } catch (...) {
+        }
+      }
+    }
   }
 
   void on_url_scheme_task_stopped(id task) {

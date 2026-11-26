@@ -245,23 +245,32 @@ public:
       // See try_create_environment() regarding
       // HRESULT_FROM_WIN32(ERROR_INVALID_STATE).
       // The result is E_ABORT if the parent window has been destroyed already.
+      // Neither is worth retrying: signal the failure so embed()'s wait loop
+      // returns an error instead of pumping messages forever.
       switch (res) {
       case HRESULT_FROM_WIN32(ERROR_INVALID_STATE):
       case E_ABORT:
+        signal_failure();
         return S_OK;
       }
+      // Retries; signals the failure itself once it gives up.
       try_create_environment();
       return S_OK;
     }
 
-    ICoreWebView2 *webview;
+    com_ptr<ICoreWebView2> webview;
+    if (!controller || FAILED(controller->get_CoreWebView2(webview.put())) ||
+        !webview) {
+      signal_failure();
+      return S_OK;
+    }
     ::EventRegistrationToken token;
-    controller->get_CoreWebView2(&webview);
     webview->add_WebMessageReceived(this, &token);
     webview->add_PermissionRequested(this, &token);
 
     if (m_cb) {
-      m_cb(controller, webview);
+      // The callback takes references of its own; ours goes with webview.
+      m_cb(controller, webview.get());
     }
     return S_OK;
   }
@@ -344,8 +353,10 @@ public:
         return;
       }
       // Not entirely sure if this error code only applies to
-      // CreateCoreWebView2Controller so we check here as well.
+      // CreateCoreWebView2Controller so we check here as well. Retrying
+      // cannot help, so give up now rather than leave embed() waiting.
       if (res == HRESULT_FROM_WIN32(ERROR_INVALID_STATE)) {
+        signal_failure();
         return;
       }
       // Wait for m_sleep_ms before trying again.
@@ -354,12 +365,21 @@ public:
       return;
     }
     // Give up.
-    if (m_cb) {
-      m_cb(nullptr, nullptr);
-    }
+    signal_failure();
   }
 
 private:
+  // Tells the creation callback that no controller is coming, which ends
+  // embed()'s wait loop with an error. Does nothing once detached.
+  void signal_failure() noexcept {
+    if (m_cb) {
+      try {
+        m_cb(nullptr, nullptr);
+      } catch (...) {
+      }
+    }
+  }
+
   HWND m_window;
   msg_cb_t m_msgCb;
   webview2_com_handler_cb_t m_cb;
@@ -478,6 +498,12 @@ private:
       // WebView2 may still hold the handler; its creation callbacks capture
       // this engine (and embed()'s locals) and must never run again.
       m_com_handler->detach();
+    }
+    // Close the controller first so WebView2 tears down its navigation and
+    // network stack before any deferral still open is released: a deferral
+    // released unanswered can then never send its request to the network.
+    if (m_controller) {
+      m_controller->Close();
     }
     abort_pending_requests();
     if (m_com_handler) {
@@ -789,8 +815,7 @@ protected:
   // Failing both means the WebView2 environment itself is unusable, which in
   // practice only happens while it is being torn down. A request left with no
   // response is passed through by WebView2, so callers holding a deferral
-  // complete it only when this returns true or the engine is going away (see
-  // complete_deferral).
+  // complete it only when this returns true (see complete_deferral).
   bool put_fail_closed_response(
       ICoreWebView2WebResourceRequestedEventArgs *args) noexcept {
     auto *env = m_com_handler ? m_com_handler->environment() : nullptr;
@@ -822,12 +847,11 @@ protected:
   }
 
   // Completes a deferral. When no response could be set the request is left
-  // deferred instead, because completing it would let WebView2 pass it on to
-  // the network unanswered; only while the engine is going away is it
-  // completed regardless, so the deferral and event args are released.
-  void complete_deferral(ICoreWebView2Deferral *deferral,
-                         bool answered) noexcept {
-    if (deferral && (answered || !is_alive())) {
+  // deferred instead (the caller's reference is merely released), because
+  // completing it would let WebView2 pass it on to the network unanswered.
+  static void complete_deferral(ICoreWebView2Deferral *deferral,
+                                bool answered) noexcept {
+    if (deferral && answered) {
       deferral->Complete();
     }
   }
@@ -984,20 +1008,39 @@ protected:
   }
 
   // Answers a still-open request with the fallback 500 and completes it.
+  // A request the handler already answered through webview_complete_request
+  // (queued, not yet run) is left alone so the fallback cannot replace that
+  // answer. When not even the fallback can be set the request stays pending,
+  // so abort_pending_requests() still releases it at teardown.
   void fail_pending_request(uint64_t request_id) noexcept {
+    if (is_request_submitted(request_id)) {
+      return; // answered; the queued completion delivers it
+    }
     auto found = m_pending_requests.find(request_id);
     if (found == m_pending_requests.end()) {
       return; // already answered
     }
-    auto pending = std::move(found->second);
-    m_pending_requests.erase(found);
-    complete_deferral(pending.deferral.get(),
-                      put_fail_closed_response(pending.args.get()));
+    if (!put_fail_closed_response(found->second.args.get())) {
+      return; // left deferred: completing it would pass it to the network
+    }
+    complete_and_erase_pending_request(found);
   }
 
-  // Answers the deferred request and completes its deferral, whatever
-  // happens on the way.
-  void finish_pending_request(pending_request_t &pending, int status,
+  // Completes the deferral of a request whose response has been set, and
+  // forgets the request. Erased before Complete() so nothing reached from
+  // Complete() can see it still pending.
+  void complete_and_erase_pending_request(
+      std::map<uint64_t, pending_request_t>::iterator found) noexcept {
+    auto pending = std::move(found->second);
+    m_pending_requests.erase(found);
+    if (pending.deferral) {
+      pending.deferral->Complete();
+    }
+  }
+
+  // Sets the answer on the deferred request, falling back to a bare 500.
+  // Returns whether any response was set; the deferral is left to the caller.
+  bool answer_pending_request(pending_request_t &pending, int status,
                               const http_headers_t &headers,
                               const std::string &body) noexcept {
     bool built = false;
@@ -1015,12 +1058,12 @@ protected:
     } catch (...) {
       built = false;
     }
-    bool answered = built ? put_response(pending.args.get(), status,
-                                         header_lines, body)
-                          : put_fail_closed_response(pending.args.get());
-    complete_deferral(pending.deferral.get(), answered);
+    return built ? put_response(pending.args.get(), status, header_lines, body)
+                 : put_fail_closed_response(pending.args.get());
   }
 
+  // When no response at all can be set the request stays pending (completing
+  // it would pass it to the network); abort_pending_requests() releases it.
   void complete_request_impl(uint64_t request_id, int status,
                              const http_headers_t &headers,
                              const std::string &body) override {
@@ -1028,19 +1071,27 @@ protected:
     if (found == m_pending_requests.end()) {
       return; // already answered, or the webview is going away
     }
-    auto pending = std::move(found->second);
-    m_pending_requests.erase(found);
-    finish_pending_request(pending, status, headers, body);
+    if (!answer_pending_request(found->second, status, headers, body)) {
+      return;
+    }
+    complete_and_erase_pending_request(found);
   }
 
-  // Answers every request still open with 503 and releases it.
+  // Answers every request still open with 503 and releases it. Runs after
+  // the controller is closed: a request that cannot even be given a bare 500
+  // any more has its deferral released without Complete(), so nothing is
+  // passed on to the network.
   void abort_pending_requests() noexcept {
     std::map<uint64_t, pending_request_t> pending_requests;
     pending_requests.swap(m_pending_requests);
     for (auto &entry : pending_requests) {
-      finish_pending_request(entry.second, 503, http_headers_t{},
-                             std::string{});
+      if (answer_pending_request(entry.second, 503, http_headers_t{},
+                                 std::string{}) &&
+          entry.second.deferral) {
+        entry.second.deferral->Complete();
+      }
     }
+    // The map going out of scope releases every deferral and event args ref.
   }
 
   noresult set_size_impl(int width, int height, webview_hint_t hints) override {
@@ -1406,9 +1457,9 @@ private:
     if (!m_controller || !m_webview) {
       return error_info{WEBVIEW_ERROR_INVALID_STATE};
     }
-    ICoreWebView2Settings *settings = nullptr;
-    auto res = m_webview->get_Settings(&settings);
-    if (res != S_OK) {
+    com_ptr<ICoreWebView2Settings> settings;
+    auto res = m_webview->get_Settings(settings.put());
+    if (res != S_OK || !settings) {
       return error_info{WEBVIEW_ERROR_UNSPECIFIED, "get_Settings failed"};
     }
     res = settings->put_AreDevToolsEnabled(debug ? TRUE : FALSE);

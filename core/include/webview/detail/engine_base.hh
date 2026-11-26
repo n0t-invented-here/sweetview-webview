@@ -42,7 +42,9 @@
 #include <list>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <unordered_set>
 
 namespace webview {
 namespace detail {
@@ -51,7 +53,10 @@ class engine_base {
 public:
   engine_base(bool owns_window) : m_owns_window{owns_window} {}
 
-  virtual ~engine_base() = default;
+  virtual ~engine_base() {
+    std::lock_guard<std::mutex> lock{m_submitted_mutex};
+    m_submitted_requests.clear();
+  }
 
   noresult navigate(const std::string &url) {
     if (url.empty()) {
@@ -225,12 +230,37 @@ window.__webview__.onUnbind(" +
       bytes.assign(static_cast<const char *>(body), body_len);
     }
     auto alive = m_alive;
-    return dispatch([this, alive, request_id, status, headers, bytes] {
-      if (!alive->load()) {
-        return; // destroyed after this was queued
-      }
-      complete_request_impl(request_id, status, headers, bytes);
-    });
+    // Recorded before the answer is queued, so a handler that answers and
+    // then throws does not have its answer replaced by the fallback 500.
+    {
+      std::lock_guard<std::mutex> lock{m_submitted_mutex};
+      m_submitted_requests.insert(request_id);
+    }
+    noresult res;
+    try {
+      res = dispatch([this, alive, request_id, status, headers, bytes] {
+        if (!alive->load()) {
+          return; // destroyed after this was queued
+        }
+        forget_submitted_request(request_id);
+        complete_request_impl(request_id, status, headers, bytes);
+      });
+    } catch (...) {
+      forget_submitted_request(request_id);
+      throw;
+    }
+    if (!res.ok()) {
+      forget_submitted_request(request_id);
+    }
+    return res;
+  }
+
+  // True while an answer from webview_complete_request for request_id is
+  // queued and has not run yet.
+  bool is_request_submitted(uint64_t request_id) const {
+    std::lock_guard<std::mutex> lock{m_submitted_mutex};
+    // NOLINTNEXTLINE(readability-container-contains): contains() requires C++20
+    return m_submitted_requests.count(request_id) > 0;
   }
 
   // Marks the engine as going away. From here on complete_request refuses
@@ -481,6 +511,11 @@ protected:
   bool owns_window() const { return m_owns_window; }
 
 private:
+  void forget_submitted_request(uint64_t request_id) noexcept {
+    std::lock_guard<std::mutex> lock{m_submitted_mutex};
+    m_submitted_requests.erase(request_id);
+  }
+
   static std::atomic_uint &window_ref_count() {
     static std::atomic_uint ref_count{0};
     return ref_count;
@@ -503,6 +538,10 @@ private:
   // False once the engine is being destroyed; see mark_destroying.
   std::shared_ptr<std::atomic<bool>> m_alive{
       std::make_shared<std::atomic<bool>>(true)};
+  // Request ids answered by complete_request whose answer is still queued;
+  // see is_request_submitted.
+  mutable std::mutex m_submitted_mutex;
+  std::unordered_set<uint64_t> m_submitted_requests;
   user_script *m_bind_script{};
   std::list<user_script> m_user_scripts;
 
